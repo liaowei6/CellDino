@@ -1,7 +1,7 @@
 <h1 align="center">CellDino</h1>
 <h2 align="center">End-to-End Cell Segmentation and Tracking with Transformer</h2>
 
-![CellDino](figures/celldino.pdf)
+![CellDino](figures/celldino.png)
 
 ## Table of Contents
 
