@@ -89,7 +89,7 @@ python train_net.py --num_gpus 1 --config-file config_path MODEL.WEIGHTS /path/t
 
 - **Inference**
 
-You can download the [pretrained model]((https://github.com/liaowei6/CellDino/releases)) and reproduce the results of our CTC submission using the following command.
+You can download the [pretrained model](https://github.com/liaowei6/CellDino/releases) and reproduce the results of our CTC submission using the following command.
 
 ```cmd
 python train_net.py --nums_gpus 1 --test --submit --config-file config_file --input_dir /path/to/input_dir --submit_dir /path/to/submit_dir MODEL.WEIGHTS /path/to/checkpoint_file
