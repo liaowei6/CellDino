@@ -14,16 +14,17 @@ import torch
 from fvcore.nn.precise_bn import get_bn_modules
 from omegaconf import OmegaConf
 from torch.nn.parallel import DistributedDataParallel
+from detectron2.structures import BitMasks, RotatedBoxes
 
 import detectron2.data.transforms as T
 from detectron2.evaluation import (
     DatasetEvaluator,
     print_csv_format,
 )
-from ..evaluation.inference import inference_on_dataset,inference_on_dataset_submit,inference_on_dataset_cell,inference_on_dataset_track
+from detectron2.data import build_detection_test_loader
+from ..evaluation.inference import inference_on_dataset,inference_on_dataset_submit,inference_on_dataset_cell,inference_on_dataset_track,inference_on_dataset_track_submit
 from detectron2.utils import comm
 from detectron2.engine.train_loop import AMPTrainer
-from detectron2.data import build_detection_test_loader
 
 class DefaultTrainer_cell(DefaultTrainer):
     """
@@ -61,8 +62,6 @@ class DefaultTrainer_cell(DefaultTrainer):
         results = OrderedDict()
         for idx, dataset_name in enumerate(cfg.DATASETS.TEST):
             data_loader = cls.build_test_loader(cfg, dataset_name, mapper)
-            # import torch.multiprocessing
-            # torch.multiprocessing.set_sharing_strategy('file_system')
             # When evaluators are passed in as arguments,
             # implicitly assume that evaluators can be created before data_loader.
             if evaluators is not None:
@@ -78,11 +77,14 @@ class DefaultTrainer_cell(DefaultTrainer):
                     results[dataset_name] = {}
                     continue
             if cfg.SUBMIT:
-                results_i = inference_on_dataset_submit(model, data_loader, evaluator, submit_dir = cfg.SUBMIT_DIR)
+                if cfg.TRACK:
+                    results_i = inference_on_dataset_track_submit(model, data_loader, evaluator, submit_dir = cfg.SUBMIT_DIR)
+                else:
+                    results_i = inference_on_dataset_submit(model, data_loader, evaluator, submit_dir = cfg.SUBMIT_DIR)
             elif cell:
                 results_i = inference_on_dataset_cell(model, data_loader, evaluator)
             elif cfg.TRACK:
-                results_i = inference_on_dataset_track(model, data_loader, evaluator)
+                results_i = inference_on_dataset_track(model, data_loader, evaluator, crop=cfg.CROP)
             else:
                 results_i = inference_on_dataset(model, data_loader, evaluator)
             results[dataset_name] = results_i
@@ -100,7 +102,7 @@ class DefaultTrainer_cell(DefaultTrainer):
         return results
 
     @classmethod
-    def build_test_loader(cls, cfg, dataset_name, mapper=None):
+    def build_test_loader(cls, cfg, dataset_name, mapper = None):
         """
         Returns:
             iterable
@@ -108,7 +110,7 @@ class DefaultTrainer_cell(DefaultTrainer):
         It now calls :func:`detectron2.data.build_detection_test_loader`.
         Overwrite it if you'd like a different data loader.
         """
-        return build_detection_test_loader(cfg, dataset_name, mapper=mapper)
+        return build_detection_test_loader(cfg, dataset_name, mapper = mapper)
 
 class AMPTrainer_cell(AMPTrainer):
     """
@@ -173,7 +175,7 @@ class AMPTrainer_cell(AMPTrainer):
                 num = num * len(i["instances"])
         data_time = time.perf_counter() - start
 
-        if self.zero_grad_before_forward and self.iter % self.accumulation_steps == 0:
+        if self.zero_grad_before_forward == 0:
             self.optimizer.zero_grad()
         with autocast():
             loss_dict = self.model(data)
@@ -183,9 +185,8 @@ class AMPTrainer_cell(AMPTrainer):
             else:
                 losses = sum(loss_dict.values())
         print("total_loss:{},loss_ce:{},loss_mask:{},loss_dice:{},loss_giou:{},loss_bbox:{}".format(losses, loss_dict["loss_ce"], loss_dict["loss_mask"], loss_dict["loss_dice"], loss_dict["loss_giou"], loss_dict["loss_bbox"]))
-        if not self.zero_grad_before_forward and self.iter % self.accumulation_steps == 0:
+        if not self.zero_grad_before_forward:
             self.optimizer.zero_grad()
-        losses = losses / self.accumulation_steps
         self.grad_scaler.scale(losses).backward()
 
         if self.log_grad_scaler:
@@ -201,9 +202,9 @@ class AMPTrainer_cell(AMPTrainer):
             )
         else:
             self._write_metrics(loss_dict, data_time)
-        if (self.iter +1) % self.accumulation_steps == 0:
-            self.grad_scaler.step(self.optimizer)
-            self.grad_scaler.update()
+
+        self.grad_scaler.step(self.optimizer)
+        self.grad_scaler.update()
 
     def state_dict(self):
         ret = super().state_dict()
@@ -229,19 +230,15 @@ class AMPTrackTrainer_cell(AMPTrainer):
         from torch.cuda.amp import autocast
 
         start = time.perf_counter()
-        data = next(self._data_loader_iter)  #每个batch包含两张连续的图片 (batch_size, 2, )
-        # 过滤掉实例数量为0的样本和大于100的
-        data_second = []
-        num = 1
-        for i in data:
-            num = num * len(i["instances"])
-            data_second.append(i["second"])
-            i.pop("second")
+        num = 0
         while not num:
             data = next(self._data_loader_iter)
             num = 1
+            data_second = []
             for i in data:
-                num = num * len(i["instances"])
+                num = num * i["instances"].gt_ids.shape[0] * i["second"]["instances"].gt_ids.shape[0]
+                data_second.append(i["second"])
+                i.pop("second")
         data_time = time.perf_counter() - start
         data_set = [data, data_second]
         batch_size = len(data)
@@ -249,37 +246,216 @@ class AMPTrackTrainer_cell(AMPTrainer):
         del data_second
         Cell_Tracker = Tracker()
         Cell_Tracker.reset()
-        for i in range(2):
+        Cell_Tracker.reverse = False
+        Cell_Tracker.pseudo = False
+        
+        # 每两步回归一次
+        if not self.zero_grad_before_forward:
+            self.optimizer.zero_grad()
+        for i in range(2):  
             if self.zero_grad_before_forward:
-                self.optimizer.zero_grad()
+                self.optimizer.zero_grad()  # 如果配置要求每次前向前清零梯度，则清零
             
             with autocast():
-                loss_dict = self.model(data_set[i], tracker = Cell_Tracker)
+                loss_dict = self.model(data_set[i], tracker=Cell_Tracker)
                 if isinstance(loss_dict, torch.Tensor):
                     losses = loss_dict
                     loss_dict = {"total_loss": loss_dict}
                 else:
                     losses = sum(loss_dict.values())
-            print("total_loss:{},loss_ce:{},loss_mask:{},loss_dice:{},loss_giou:{},loss_bbox:{}".format(losses, loss_dict["loss_ce"], loss_dict["loss_mask"], loss_dict["loss_dice"], loss_dict["loss_giou"], loss_dict["loss_bbox"]))
-            if not self.zero_grad_before_forward:
-                self.optimizer.zero_grad()
-
+            
+            print("total_loss:{}".format(losses))
+            # 缩放损失并反向传播（累积梯度）
             self.grad_scaler.scale(losses).backward()
-
+            
             if self.log_grad_scaler:
                 storage = get_event_storage()
                 storage.put_scalar("[metric]grad_scaler", self.grad_scaler.get_scale())
-
+            
             self.after_backward()
-
+            
             if self.async_write_metrics:
-                # write metrics asynchronically
+                # 异步写入指标
                 self.concurrent_executor.submit(
                     self._write_metrics, loss_dict, data_time, iter=self.iter
                 )
             else:
                 self._write_metrics(loss_dict, data_time)
-
-            self.grad_scaler.step(self.optimizer)
-            self.grad_scaler.update()
+        # 在for循环结束后执行优化器步骤和更新grad_scaler
+        self.grad_scaler.step(self.optimizer)
+        self.grad_scaler.update()
         
+        #每一步都进行回归
+        # for i in range(2):  
+        #     if self.zero_grad_before_forward:
+        #         self.optimizer.zero_grad()
+            
+        #     with autocast():
+        #         loss_dict = self.model(data_set[i], tracker = Cell_Tracker)
+        #         if isinstance(loss_dict, torch.Tensor):
+        #             losses = loss_dict
+        #             loss_dict = {"total_loss": loss_dict}
+        #         else:
+        #             losses = sum(loss_dict.values())
+        #     print("total_loss:{}".format(losses))
+        #     if not self.zero_grad_before_forward:
+        #         self.optimizer.zero_grad()
+
+        #     self.grad_scaler.scale(losses).backward()
+
+        #     if self.log_grad_scaler:
+        #         storage = get_event_storage()
+        #         storage.put_scalar("[metric]grad_scaler", self.grad_scaler.get_scale())
+
+        #     self.after_backward()
+
+        #     if self.async_write_metrics:
+        #         # write metrics asynchronically
+        #         self.concurrent_executor.submit(
+        #             self._write_metrics, loss_dict, data_time, iter=self.iter
+        #         )
+        #     else:
+        #         self._write_metrics(loss_dict, data_time)
+
+        #     self.grad_scaler.step(self.optimizer)
+        #     self.grad_scaler.update() 
+
+        # if self.zero_grad_before_forward:
+        #     self.optimizer.zero_grad()
+        
+        # with autocast():
+        #     loss_dict = self.model(data_set[0], tracker = Cell_Tracker)
+        #     if isinstance(loss_dict, torch.Tensor):
+        #         losses = loss_dict
+        #         loss_dict = {"total_loss": loss_dict}
+        #     else:
+        #         losses = sum(loss_dict.values())
+        # print("total_loss:{}".format(losses))
+        # if not self.zero_grad_before_forward:
+        #     self.optimizer.zero_grad()
+
+        # self.grad_scaler.scale(losses).backward()
+
+        #第一帧采用未标注数据但是不进行梯度回归，第二帧是全监督数据进行全监督
+        # Cell_Tracker = Tracker()
+        # Cell_Tracker.reset()
+        # Cell_Tracker.reverse = True
+        # Cell_Tracker.pseudo = False
+        # if self.zero_grad_before_forward:
+        #     self.optimizer.zero_grad()    
+        # with autocast():
+        #     loss_dict = self.model(data_set[1], tracker = Cell_Tracker)
+        #     loss_dict = self.model(data_set[0], tracker = Cell_Tracker)
+        #     if isinstance(loss_dict, torch.Tensor):
+        #         losses = loss_dict
+        #         loss_dict = {"total_loss": loss_dict}
+        #     else:
+        #         losses = sum(loss_dict.values())
+        # print("total_loss:{}".format(losses))
+        # if not self.zero_grad_before_forward:
+        #     self.optimizer.zero_grad()
+
+        # self.grad_scaler.scale(losses).backward()
+
+        # if self.log_grad_scaler:
+        #     storage = get_event_storage()
+        #     storage.put_scalar("[metric]grad_scaler", self.grad_scaler.get_scale())
+
+        # self.after_backward()
+
+        # if self.async_write_metrics:
+        #     # write metrics asynchronically
+        #     self.concurrent_executor.submit(
+        #         self._write_metrics, loss_dict, data_time, iter=self.iter
+        #     )
+        # else:
+        #     self._write_metrics(loss_dict, data_time)
+
+        # self.grad_scaler.step(self.optimizer)
+        # self.grad_scaler.update()
+
+        #先进行第一帧全监督，第二帧弱监督
+        # if self.zero_grad_before_forward:
+        #     self.optimizer.zero_grad()
+        
+        # with autocast():
+        #     loss_dict = self.model(data_set[0], tracker = Cell_Tracker)
+        #     if isinstance(loss_dict, torch.Tensor):
+        #         losses = loss_dict
+        #         loss_dict = {"total_loss": loss_dict}
+        #     else:
+        #         losses = sum(loss_dict.values())
+        # print("total_loss:{}".format(losses))
+        # if not self.zero_grad_before_forward:
+        #     self.optimizer.zero_grad()
+
+        # self.grad_scaler.scale(losses).backward()
+
+        # if self.log_grad_scaler:
+        #     storage = get_event_storage()
+        #     storage.put_scalar("[metric]grad_scaler", self.grad_scaler.get_scale())
+
+        # self.after_backward()
+
+        # if self.async_write_metrics:
+        #     # write metrics asynchronically
+        #     self.concurrent_executor.submit(
+        #         self._write_metrics, loss_dict, data_time, iter=self.iter
+        #     )
+        # else:
+        #     self._write_metrics(loss_dict, data_time)
+
+        # self.grad_scaler.step(self.optimizer)
+        # self.grad_scaler.update() 
+        # #生成伪标签
+        # Cell_Tracker.pseudo = True
+        # with autocast():
+        #     pseudo_targets = self.model(data_set[1], tracker = Cell_Tracker)
+        #     if data_set[1][0]['instances'].gt_masks.shape[0] != pseudo_targets[0]["masks"].shape[0]:
+        #         print("find")
+        #     for i in range(len(data_set[1])):
+        #         h, w = data_set[1][i]['instances'].image_size
+        #         data_set[1][i]['instances'].gt_masks = pseudo_targets[i]["masks"]
+        #         data_set[1][i]["instances"].gt_boxes = RotatedBoxes(pseudo_targets[i]["boxes"])
+        #         data_set[1][i]["instances"].gt_boxes.scale(float(w), float(h))
+        #         data_set[1][i]['instances'].gt_ids = pseudo_targets[i]["gt_ids"]
+        #         data_set[1][i]['instances'].gt_classes = pseudo_targets[i]["labels"]
+        # #第一帧采用未标注数据但是不进行梯度回归，第二帧是全监督数据进行全监督
+        # Cell_Tracker = Tracker()
+        # Cell_Tracker.reset()
+        # Cell_Tracker.reverse = True
+        # Cell_Tracker.pseudo = False
+        # for i in range(2):
+        #     for j in range(len(data_set[1-i])):
+        #         data_set[1-i][j]["image"] = data_set[1-i][j]["image_strong"]
+        #     if self.zero_grad_before_forward:
+        #         self.optimizer.zero_grad()    
+        #     with autocast():
+        #         loss_dict = self.model(data_set[1-i], tracker = Cell_Tracker)
+        #         if isinstance(loss_dict, torch.Tensor):
+        #             losses = loss_dict
+        #             loss_dict = {"total_loss": loss_dict}
+        #         else:
+        #             losses = sum(loss_dict.values())
+        #     print("total_loss:{}".format(losses))
+        #     if not self.zero_grad_before_forward:
+        #         self.optimizer.zero_grad()
+
+        #     self.grad_scaler.scale(losses).backward()
+
+        #     if self.log_grad_scaler:
+        #         storage = get_event_storage()
+        #         storage.put_scalar("[metric]grad_scaler", self.grad_scaler.get_scale())
+
+        #     self.after_backward()
+
+        #     if self.async_write_metrics:
+        #         # write metrics asynchronically
+        #         self.concurrent_executor.submit(
+        #             self._write_metrics, loss_dict, data_time, iter=self.iter
+        #         )
+        #     else:
+        #         self._write_metrics(loss_dict, data_time)
+
+        #     self.grad_scaler.step(self.optimizer)
+        #     self.grad_scaler.update()
