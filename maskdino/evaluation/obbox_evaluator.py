@@ -78,7 +78,19 @@ class ObboxEvaluator(COCOEvaluator):
             if len(prediction) > 1:
                 self._predictions.append(prediction)
 
-        
+    def process_track(self, inputs, outputs, seg_result=None, crop=False):
+        for input, output in zip(inputs, outputs):
+            prediction = {"image_id": input["image_id"]}
+
+            if "instances" in output:
+                instances = output["instances"].to(self._cpu_device)
+                prediction["instances"] = instances_to_coco_json_cell(instances, input["image_id"], thresdhold=0.01, crop=crop)
+                prediction["ctc"] = instances_to_ctc_track(instances, input["image_id"], input["file_name"],thresdhold = 0.01, seg_result=seg_result, crop=crop)
+            if "proposals" in output:
+                prediction["proposals"] = output["proposals"].to(self._cpu_device)
+            if len(prediction) > 1:
+                self._predictions.append(prediction)
+
     def process_test(self, inputs, outputs):
         for input, output in zip(inputs, outputs):
             prediction = {"image_id": input["image_id"]}
@@ -86,6 +98,16 @@ class ObboxEvaluator(COCOEvaluator):
             if "instances" in output:
                 instances = output["instances"].to(self._cpu_device)
                 prediction["ctc"] = instances_to_ctc_test(instances, input["image_id"], input["file_name"], thresdhold = 0.01)
+            if len(prediction) > 1:
+                self._predictions.append(prediction)
+
+    def process_track_test(self, inputs, outputs):
+        for input, output in zip(inputs, outputs):
+            prediction = {"image_id": input["image_id"]}
+
+            if "instances" in output:
+                instances = output["instances"].to(self._cpu_device)
+                prediction["ctc"] = instances_to_ctc_test(instances, input["image_id"], input["file_name"],thresdhold = 0.01)
             if len(prediction) > 1:
                 self._predictions.append(prediction)
 
@@ -143,9 +165,8 @@ class ObboxEvaluator(COCOEvaluator):
         self._logger.info("Preparing results for COCO format ...")
         coco_results = list(itertools.chain(*[x["instances"] for x in predictions]))
         tasks = self._tasks or self._tasks_from_predictions(coco_results)
-        tasks = []
         if "ctc" in predictions[0]:
-            tasks.append("ctc")
+            tasks = ["ctc"]
         # unmap the category ids for COCO
         if hasattr(self._metadata, "thing_dataset_id_to_contiguous_id"):
             dataset_id_to_contiguous_id = self._metadata.thing_dataset_id_to_contiguous_id
@@ -181,11 +202,11 @@ class ObboxEvaluator(COCOEvaluator):
         )
         for task in sorted(tasks):
             assert task in {"bbox", "segm", "keypoints", 'ctc'}, f"Got unknown task: {task}!"
-            if task == "bbox":
-                self._eval_obox_proposals(predictions)
-                continue
-            elif task == "ctc":
+            if task == "ctc":
                 self._eval_ctc(predictions)
+                continue
+            elif task == "bbox":
+                # self._eval_obox_proposals(predictions)
                 continue
             coco_eval = (
                 _evaluate_predictions_on_coco(
@@ -193,7 +214,7 @@ class ObboxEvaluator(COCOEvaluator):
                     coco_results,
                     task,
                     kpt_oks_sigmas=self._kpt_oks_sigmas,
-                    use_fast_impl=self._use_fast_impl,
+                    cocoeval_fn=COCOeval_opt if self._use_fast_impl else COCOeval,
                     img_ids=img_ids,
                     max_dets_per_image=self._max_dets_per_image,
                 )
@@ -216,25 +237,57 @@ class ObboxEvaluator(COCOEvaluator):
             masks.append(prediction["ctc"]["segmentation"])
             index_dataset.append(prediction["ctc"]["index_dataset"])
         result_path = "output/testing_dataset/"
-        id = 1
+        id = 0
         last_index = index_dataset[0]
         for index, mask in zip(index_dataset, masks):
             if index != last_index:
                 last_index = index
-                id = 1
-            mask = mask.numpy()
+                id = 0
+            mask = mask.cpu().numpy()
             if len(predictions) == 16:
-                mask_file = os.path.join(result_path + index + "_RES", "mask" + str(id + 75).zfill(3) + ".tif")
+                mask_file = os.path.join(result_path + index + "_RES", "mask" + str(id + 76).zfill(3) + ".tif")
+            elif len(predictions) == 22:
+                mask_file = os.path.join(result_path + index + "_RES", "mask" + str(id + 104).zfill(3) + ".tif")
+            elif len(predictions) == 18:
+                mask_file = os.path.join(result_path + index + "_RES", "mask" + str(id + 83).zfill(3) + ".tif")
+            elif len(predictions) == 21 and index == "01":
+                mask_file = os.path.join(result_path + index + "_RES", "mask" + str(id + 59).zfill(3) + ".tif")
+            elif len(predictions) == 21 and index == "02":
+                mask_file = os.path.join(result_path + index + "_RES", "mask" + str(id + 135).zfill(3) + ".tif")
+            elif len(predictions) == 8:
+                mask_file = os.path.join(result_path + index + "_RES", "mask" + str(id + 44).zfill(3) + ".tif")
+            elif len(predictions) == 60:
+                mask_file = os.path.join(result_path + index + "_RES", "mask" + str(id + 270).zfill(3) + ".tif")
             else:
-                mask_file = os.path.join(result_path + index + "_RES", "mask" + str(id + 82).zfill(3) + ".tif")
+                mask_file = os.path.join(result_path + index + "_RES", "mask" + str(id + 0).zfill(3) + ".tif")
             id += 1
             imsave(mask_file, mask.astype(np.uint16),)
-        scores_1 = calc_ctc_scores(Path(result_path + "01_RES"), Path(result_path + "01_GT"))
-        scores_2 = calc_ctc_scores(Path(result_path + "02_RES"), Path(result_path + "02_GT"))
-        scores = {}
-        scores["DET"] = (scores_1["DET"] + scores_2["DET"]) / 2
-        scores["SEG"] = (scores_1["SEG"] + scores_2["SEG"]) / 2
-        self._results["ctc"] = scores
+        #for deepcell
+        if last_index not in ["01", "02"]:
+            scores = {}
+            scores["DET"] = 0
+            scores["SEG"] = 0
+            scores["TRA"] = 0
+            for i in range(12):
+                score = calc_ctc_scores(Path(f"{result_path}{i:02}_RES"), Path(f"{result_path}{i:02}_GT"))
+                scores["DET"] += score["DET"]
+                scores["SEG"] += score["SEG"]
+                scores['TRA'] += score["TRA"]
+            scores["DET"] = scores["DET"] / 12
+            scores["SEG"] = scores["SEG"] / 12
+            scores["TRA"] = scores["TRA"] / 12
+            self._results["ctc"] = scores
+        #for CTC
+        else:
+            scores_1 = calc_ctc_scores(Path(result_path + "01_RES"), Path(result_path + "01_GT"))
+            scores_2 = calc_ctc_scores(Path(result_path + "02_RES"), Path(result_path + "02_GT"))
+            scores = {}
+            scores["DET"] = (scores_1["DET"] + scores_2["DET"]) / 2
+            scores["SEG"] = (scores_1["SEG"] + scores_2["SEG"]) / 2
+            if "TRA" in scores_1:
+                scores['TRA'] = (scores_1["TRA"] + scores_2["TRA"]) / 2
+                print(scores['TRA'])
+            self._results["ctc"] = scores
 
 def calc_ctc_scores(result_dir, gt_dir):
     """
@@ -254,7 +307,7 @@ def calc_ctc_scores(result_dir, gt_dir):
         file
         for file in os.listdir(Path(ctc_measure_dir, platform_name))
         if "Measure" in file
-    ]   #获取测试文件
+    ]   
 
     data_dir = gt_dir.parent
     data_set_id = gt_dir.name.split("_")[0]
@@ -327,7 +380,7 @@ def calc_ctc_scores(result_dir, gt_dir):
     return all_results
 
 
-def instances_to_coco_json_cell(instances, img_id, thresdhold = 0.01):
+def instances_to_coco_json_cell(instances, img_id, thresdhold = 0.01, crop=False):
     """
     Dump an "Instances" object to a COCO-format json that's used for evaluation.
 
@@ -348,6 +401,8 @@ def instances_to_coco_json_cell(instances, img_id, thresdhold = 0.01):
     classes = instances.pred_classes.tolist()
 
     has_mask = instances.has("pred_masks")
+    if crop:
+        has_mask = False
     if has_mask:
         # use RLE to encode the masks, because they are too large and takes memory
         # since this evaluator stores outputs of the entire dataset
@@ -390,7 +445,7 @@ def instances_to_coco_json_cell(instances, img_id, thresdhold = 0.01):
     return results
 
 
-def instances_to_ctc(instances, img_id, file, thresdhold=0.01):
+def instances_to_ctc(instances, img_id, file, thresdhold=0.01, seg_result=None, crop=False):
     """
     Dump an "Instances" object to a CTC format that's used for evaluation.
 
@@ -405,27 +460,74 @@ def instances_to_ctc(instances, img_id, file, thresdhold=0.01):
     if num_instance == 0:
         return []
 
-    scores = instances.scores
-    classes = instances.pred_classes.tolist()
+    if crop:
+        seg = seg_result
+    else:
+        scores = instances.scores
+        classes = instances.pred_classes.tolist()
 
-    masks = instances.pred_masks
-    
-    #根据scores对mask进行排序，对于重叠的mask，认为score的高的遮挡score低的mask
-    _, index  = torch.sort(scores)
+        masks = instances.pred_masks
 
-    seg = torch.zeros(instances.image_size)
-    
-    for i in index:
-        if classes[i] == 0 and scores[i] > thresdhold:
-            mask = masks[i]
-            a = 1 +i.item()
-            seg[mask > 0] = a 
+        _, index  = torch.sort(scores)
+        seg = torch.zeros(instances.image_size)
+        for i in index:
+            if classes[i] == 0 and scores[i] > thresdhold:
+                mask = masks[i]
+                a = 1 +i.item()
+                seg[mask > 0] = a 
 
     file_name = file.split("/")
     results = {}
     results["image_id"] = img_id
     results["segmentation"] = seg
-    results["index_dataset"] = file_name[3]
+    if file_name[3][:5] == "batch":
+        results["index_dataset"] = f"{int(file_name[3][6:]):02}"
+    else:
+        results["index_dataset"] = file_name[3]
+        if results["index_dataset"] not in ["01", "02"]:
+            results["index_dataset"] = file_name[2]
+    return results
+
+def instances_to_ctc_track(instances, img_id, file, thresdhold=0.01, seg_result=None, crop=False):
+    """
+    Dump an "Instances" object to a CTC format that's used for evaluation.
+
+    Args:
+        instances (Instances):
+        img_id (int): the image id
+
+    Returns:
+        list[dict]: list of json annotations in COCO format.
+    """
+    num_instance = len(instances)
+    if num_instance == 0:
+        return []
+    if crop:
+        seg = seg_result
+    else:
+        scores = instances.scores
+        classes = instances.pred_classes.tolist()
+
+        masks = instances.pred_masks
+        track_ids = instances.track_id.to(torch.float32)
+        _, index  = torch.sort(scores)
+        #print(scores)
+        seg = torch.zeros(instances.image_size)
+    
+        for i in index:
+            if classes[i] == 0 and scores[i] > thresdhold:
+                mask = masks[i]
+                seg[mask > 0] = track_ids[i]
+    file_name = file.split("/")
+    results = {}
+    results["image_id"] = img_id
+    results["segmentation"] = seg
+    if file_name[3][:5] == "batch":
+        results["index_dataset"] = f"{int(file_name[3][6:]):02}"
+    else:
+        results["index_dataset"] = file_name[3]
+        if results["index_dataset"] not in ["01", "02"]:
+            results["index_dataset"] = file_name[2]
     return results
 
 def instances_to_ctc_test(instances, img_id, file, thresdhold = 0.01):
@@ -448,7 +550,6 @@ def instances_to_ctc_test(instances, img_id, file, thresdhold = 0.01):
 
     masks = instances.pred_masks
     
-    #根据scores对mask进行排序，对于重叠的mask，认为score的高的遮挡score低的mask
     _, index  = torch.sort(scores)
 
     seg = torch.zeros(instances.image_size)
@@ -466,6 +567,41 @@ def instances_to_ctc_test(instances, img_id, file, thresdhold = 0.01):
     results["index_dataset"] = file_name[2]
     return results
 
+def instances_to_ctc_track_test(instances, img_id, file, thresdhold = 0.01):
+    """
+    Dump an "Instances" object to a CTC format that's used for evaluation.
+
+    Args:
+        instances (Instances):
+        img_id (int): the image id
+
+    Returns:
+        list[dict]: list of json annotations in COCO format.
+    """
+    num_instance = len(instances)
+    if num_instance == 0:
+        return []
+
+    scores = instances.scores
+    classes = instances.pred_classes.tolist()
+
+    masks = instances.pred_masks
+    track_ids = instances.track_id
+    _, index  = torch.sort(scores)
+
+    seg = torch.zeros(instances.image_size)
+    
+    for i in index:
+        if classes[i] == 0 and scores[i] > thresdhold:
+            mask = masks[i]
+            seg[mask > 0] = track_ids[i]
+
+    file_name = file.split("/")
+    results = {}
+    results["image_id"] = img_id
+    results["segmentation"] = seg
+    results["index_dataset"] = file_name[2]
+    return results
 
 def _evaluate_box_proposals(dataset_predictions, coco_api, thresholds=None, area="all", limit=None):
     """

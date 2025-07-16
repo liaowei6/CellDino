@@ -66,6 +66,7 @@ class Visualizer_cell(Visualizer):
                 g = int(md5_hash[2:4], 16)  # 取哈希值第三、四位作为G分量
                 b = int(md5_hash[4:6], 16)  # 取哈希值第五、六位作为B分量
                 rgb = np.array((r/255, g/255, b/255))
+                #rgb = np.array((1,1,1))
                 colors.append(rgb)
         if self._instance_mode == ColorMode.IMAGE_BW:
             self.output.reset_image(

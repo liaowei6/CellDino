@@ -174,6 +174,11 @@ class CellbboxEvaluator(COCOEvaluator):
             if task == "ctc":
                 self._eval_ctc(predictions)
                 continue
+            elif task == "bbox":
+                # self._eval_obox_proposals(predictions)
+                continue
+            elif task == "segm":
+                continue
             coco_eval = (
                 _evaluate_predictions_on_coco(
                     self._coco_api,
@@ -203,22 +208,55 @@ class CellbboxEvaluator(COCOEvaluator):
             masks.append(prediction["ctc"]["segmentation"])
             index_dataset.append(prediction["ctc"]["index_dataset"])
         result_path = "output/testing_dataset/"
-        id = 1
+        id = 0
         last_index = index_dataset[0]
         for index, mask in zip(index_dataset, masks):
             if index != last_index:
                 last_index = index
-                id = 1
-            mask = mask.numpy()
-            mask_file = os.path.join(result_path + index + "_RES", "mask" + str(id + 75).zfill(3) + ".tif")
+                id = 0
+            mask = mask.cpu().numpy()
+            if len(predictions) == 16:
+                mask_file = os.path.join(result_path + index + "_RES", "mask" + str(id + 76).zfill(3) + ".tif")
+            elif len(predictions) == 22:
+                mask_file = os.path.join(result_path + index + "_RES", "mask" + str(id + 104).zfill(3) + ".tif")
+            elif len(predictions) == 18:
+                mask_file = os.path.join(result_path + index + "_RES", "mask" + str(id + 83).zfill(3) + ".tif")
+            elif len(predictions) == 21 and index == "01":
+                mask_file = os.path.join(result_path + index + "_RES", "mask" + str(id + 59).zfill(3) + ".tif")
+            elif len(predictions) == 21 and index == "02":
+                mask_file = os.path.join(result_path + index + "_RES", "mask" + str(id + 135).zfill(3) + ".tif")
+            elif len(predictions) == 8:
+                mask_file = os.path.join(result_path + index + "_RES", "mask" + str(id + 44).zfill(3) + ".tif")
+            elif len(predictions) == 60:
+                mask_file = os.path.join(result_path + index + "_RES", "mask" + str(id + 270).zfill(3) + ".tif")
+            else:
+                mask_file = os.path.join(result_path + index + "_RES", "mask" + str(id + 0).zfill(3) + ".tif")
             id += 1
             imsave(mask_file, mask.astype(np.uint16),)
-        scores_1 = calc_ctc_scores(Path(result_path + "01_RES"), Path(result_path + "01_GT"))
-        scores_2 = calc_ctc_scores(Path(result_path + "02_RES"), Path(result_path + "02_GT"))
-        scores = {}
-        scores["DET"] = (scores_1["DET"] + scores_2["DET"]) / 2
-        scores["SEG"] = (scores_1["SEG"] + scores_2["SEG"]) / 2
-        self._results["ctc"] = scores
+        #针对deepcell数据集
+        if last_index not in ["01", "02"]:
+            scores = {}
+            scores["DET"] = 0
+            scores["SEG"] = 0
+            for i in range(12):
+                score = calc_ctc_scores(Path(f"{result_path}{i:02}_RES"), Path(f"{result_path}{i:02}_GT"))
+                scores["DET"] += score["DET"]
+                scores["SEG"] += score["SEG"]
+            scores["DET"] = scores["DET"] / 12
+            scores["SEG"] = scores["SEG"] / 12
+            self._results["ctc"] = scores
+        # #针对CTC数据集
+        else:
+            scores_1 = calc_ctc_scores(Path(result_path + "01_RES"), Path(result_path + "01_GT"))
+            scores_2 = calc_ctc_scores(Path(result_path + "02_RES"), Path(result_path + "02_GT"))
+            scores = {}
+            scores["DET"] = (scores_1["DET"] + scores_2["DET"]) / 2
+            scores["SEG"] = (scores_1["SEG"] + scores_2["SEG"]) / 2
+            if "TRA" in scores_1:
+                scores['TRA'] = (scores_1["TRA"] + scores_2["TRA"]) / 2
+                print(scores['TRA'])
+            self._results["ctc"] = scores
+
 
 def calc_ctc_scores(result_dir, gt_dir):
     """
@@ -410,7 +448,12 @@ def instances_to_ctc(instances, img_id, file, thresdhold=0.01):
     results = {}
     results["image_id"] = img_id
     results["segmentation"] = seg
-    results["index_dataset"] = file_name[3]
+    if file_name[3][:5] == "batch":
+        results["index_dataset"] = f"{int(file_name[3][6:]):02}"
+    else:
+        results["index_dataset"] = file_name[3]
+        if results["index_dataset"] not in ["01", "02"]:
+            results["index_dataset"] = file_name[2]
     return results
 
 
