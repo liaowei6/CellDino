@@ -40,7 +40,7 @@ import torch
 import detectron2.utils.comm as comm
 from detectron2.checkpoint import DetectionCheckpointer
 from detectron2.config import get_cfg
-from detectron2.data import MetadataCatalog, build_detection_train_loader, DatasetCatalog
+from detectron2.data import MetadataCatalog, build_detection_train_loader
 #from detectron2.data.datasets import register_coco_instances
 from detectron2.evaluation import (
     CityscapesInstanceEvaluator,
@@ -63,6 +63,7 @@ from maskdino import (
     CellinstanceDatasetMapper,
     CellinstanceObboxDatasetMapper,
     CellTrackDatasetMapper,
+    CellTrackDatasetMapper_simi,
     COCOInstanceNewBaselineDatasetMapper,
     COCOPanopticNewBaselineDatasetMapper,
     InstanceSegEvaluator,
@@ -238,8 +239,10 @@ class Trainer(DefaultTrainer_cell):
             mapper = LiveCellinstanceObboxDatasetMapper(cfg, True)
             return build_detection_train_loader(cfg, mapper)
         # cell isntance segmentation 
-        elif cfg.INPUT.DATASET_MAPPER_NAME =="cell_instance_detr":
-            if cfg.TRACK:
+        elif cfg.INPUT.DATASET_MAPPER_NAME =="cell_instance_detr":  
+            if cfg.SIMI:
+                mapper = CellTrackDatasetMapper_simi(cfg, True)
+            elif cfg.TRACK:
                 mapper = CellTrackDatasetMapper(cfg, True, is_crop=cfg.CROP)
             elif cfg.MODEL.MaskDINO.OBOX_LOSS:
                 mapper = CellinstanceObboxDatasetMapper(cfg, True, is_crop=cfg.CROP)
@@ -383,11 +386,21 @@ def setup(args):
         cfg.SUBMIT_DIR = args.submit_dir
         paths = args.input_dir.split("/")
         if 'Fluo-N2DH-GOWT1' in paths:
-            cfg.INPUT.IMAGE_SIZE = 960
-            cfg.INPUT.MIN_SIZE_TEST = 960
+            cfg.INPUT.IMAGE_SIZE = 1024
+            cfg.INPUT.MIN_SIZE_TEST = 1024
         elif 'DIC-C2DH-HeLa' in paths:
             cfg.INPUT.IMAGE_SIZE = 512
             cfg.INPUT.MIN_SIZE_TEST = 512
+        elif 'Fluo-C2DL-Huh7' in paths:
+            cfg.INPUT.IMAGE_SIZE = 1024
+            cfg.INPUT.MIN_SIZE_TEST = 1024
+            cfg.MODEL.MaskDINO.NUM_OBJECT_QUERIES = 200
+        elif 'Fluo-N2DH-SIM+' in paths:
+            cfg.INPUT.IMAGE_SIZE = 640
+            cfg.INPUT.MIN_SIZE_TEST = 640
+        elif 'Fluo-N2DL-HeLa' in paths:
+            cfg.INPUT.IMAGE_SIZE = 640
+            cfg.INPUT.MIN_SIZE_TEST = 640
     if args.test:
         cfg.DATASETS.TEST = ("celldata_test",)
     cfg.freeze()
@@ -426,7 +439,7 @@ def main(args):
         checkpointer.resume_or_load(
             cfg.MODEL.WEIGHTS, resume=args.resume
         )
-        res = Trainer.test(cfg, model, cell=False, track=cfg.TRACK, mapper=DatasetMapper_test(cfg, False))
+        res = Trainer.test(cfg, model, cell=False, track=cfg.TRACK)
         return res
 
     trainer = Trainer(cfg)
@@ -442,31 +455,16 @@ if __name__ == "__main__":
     parser.add_argument('--EVAL_FLAG', type=int, default=1)
     parser.add_argument("--input_dir", default=None, type=str, help="input file path")
     parser.add_argument("--submit_dir", default=None, type=str, help="submit file path")
-    # parser.add_argument("--input_dir", default=None, type=str, help="input file path")
-    # parser.add_argument("--submit_dir", default=None, type=str, help="submit file path") 
+    parser.add_argument("--train_file", default=None, type=str, help="train file path")
+    parser.add_argument("--val_file", default=None, type=str, help="val file path")
+    parser.add_argument("--test_file", default=None, type=str, help="test file path")
     args = parser.parse_args()
     if args.submit:
-        register_coco_instances("celldata_test", {}, args.input_dir + "/instances.json", "")
-    #DatasetCatalog.register("celldata", CellData)
-     
-    
+        register_coco_instances("celldata_test", {}, args.input_dir + "instances.json", "")
     else:
-        register_coco_instances("live_cell_train", {}, "datasets/live_cell/images/train.json", "")  
-        #register_coco_instances("celldata_train", {}, "datasets/crops/instances.json", "") 
-        register_coco_instances("celldata_train", {}, "datasets/Fluo-N2DH-GOWT1/train/instances.json", "")
-        register_coco_instances("celldata_val", {}, "datasets/Fluo-N2DH-GOWT1/val/instances.json", "")
-        register_coco_instances("celldata_test", {}, "datasets/Fluo-N2DH-GOWT1-test/instances.json", "")
-        #register_coco_instances("celldata_test", {}, "datasets/DIC-C2DH-HeLa-test/instances.json", "")
-        #register_coco_instances("celldata_train", {}, "datasets/Fluo-N2DL-HeLa/train/instances.json", "")
-        #register_coco_instances("celldata_val", {}, "datasets/Fluo-N2DH-HeLa/val/instances.json", "")
-        #register_coco_instances("celldata_train", {}, "datasets/DIC-C2DH-HeLa/train/instances.json", "")
-        #register_coco_instances("celldata_train", {}, "datasets/DIC-C2DH-HeLa/train/instances.json", "")
-        #register_coco_instances("celldata_val", {}, "datasets/DIC-C2DH-HeLa/val/instances.json", "")
-    
-    # random port
-    #固定随机数种子用以测试
-    np.random.seed(3407)
-    torch.manual_seed(3407)
+        register_coco_instances("celldata_train", {}, args.train_file, "")
+        register_coco_instances("celldata_val", {}, args.val_file, "")
+        #register_coco_instances("celldata_test", {}, args.test_file, "")
     port = random.randint(1000, 20000)
     args.dist_url = 'tcp://127.0.0.1:' + str(port)
     print("Command Line Args:", args)

@@ -20,7 +20,7 @@ from pathlib import Path
 
 # data configs
 FILE_PATH = Path(__file__)
-PROJECT_PATH = os.path.join(*FILE_PATH.parts[:-3])
+PROJECT_PATH = os.path.join(*FILE_PATH.parts[:-1])
 
 RAW_DATA_PATH = os.path.join(PROJECT_PATH, "ctc_raw_data/train")
 DATA_PATH_DEST = os.path.join(PROJECT_PATH, "datasets")
@@ -32,9 +32,9 @@ TRAIN_VAL_SPLIT = 0.1
 
 DATA_SETS = [
 #    "Fluo-N2DH-SIM+",
-    "Fluo-C2DL-MSC",
+#    "Fluo-C2DL-MSC",
 #    "Fluo-N2DH-GOWT1",
-#    "PhC-C2DL-PSC",
+    "PhC-C2DL-PSC",
 #    "BF-C2DL-HSC",
 #    "Fluo-N2DL-HeLa",
 #    "BF-C2DL-MuSC",

@@ -29,12 +29,13 @@ TORCH_CUDA_ARCH_LIST='8.0' FORCE_CUDA=1 python setup.py build install
 ```bash
 conda create --name maskdino python=3.9 -y
 conda activate maskdino
-conda install pytorch==1.9.0 torchvision==0.10.0 cudatoolkit=10.2 -c pytorch
+conda install pytorch==2.0.0 torchvision==0.15.0 torchaudio==2.0.0 pytorch-cuda=11.8 -c pytorch -c nvidia
 pip install -U opencv-python
 
 # under your working directory
 #Detectron2
-python -m pip install detectron2 -f https://dl.fbaipublicfiles.com/detectron2/wheels/cu102/torch1.9/index.html  #Linux only
+git clone https://github.com/facebookresearch/detectron2.git
+python -m pip install -e detectron2
 
 pip install -r requirements.txt
 cd maskdino/modeling/pixel_decoder/ops
