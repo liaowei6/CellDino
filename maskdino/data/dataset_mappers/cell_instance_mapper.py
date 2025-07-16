@@ -9,6 +9,7 @@ import os
 import numpy as np
 import torch
 import tifffile
+import cv2
 import pycocotools.mask as mask_util
 from detectron2.config import configurable
 from detectron2.data import detection_utils as utils
@@ -30,9 +31,6 @@ from pycocotools import mask as coco_mask
 
 __all__ = ["CellinstanceDatasetMapper"]
 
-#固定随机数种子用以测试
-seed_value = 30
-np.random.seed(30)
 
 def annotations_to_instances(annos, image_size):
     """
@@ -148,15 +146,15 @@ def build_transform_gen(cfg, is_train):
         T.ResizeScale(
             min_scale=min_scale, max_scale=max_scale, target_height=image_size, target_width=image_size
         ),
-        T.FixedSizeCrop(crop_size=(image_size, image_size)),
+        T.FixedSizeCrop(crop_size=(image_size, image_size),seg_pad_value=0),
     ])
 
     return augmentation
 
-def normalize(img, lower=0.01, upper=99.99):
+def normalize(img, lower=0.01, upper=99.99, low_value=0, up_value=255):
     lower_perc = np.percentile(img, lower)
     upper_perc = np.percentile(img, upper)
-    return np.interp(img, (lower_perc, upper_perc), (0, 255))
+    return np.interp(img, (lower_perc, upper_perc), (low_value, up_value))
 
 class CellinstanceDatasetMapper:
     """
@@ -218,10 +216,23 @@ class CellinstanceDatasetMapper:
             dict: a format that builtin models in detectron2 accept
         """
         dataset_dict = copy.deepcopy(dataset_dict)  # it will be modified by code below
-        image = utils.read_image(dataset_dict["file_name"], format=self.img_format)
-        #对图像进行归一化
-        image = normalize(image.astype("float32"), lower=1.0, upper=99.0).astype("float32")
+        image = tifffile.imread(dataset_dict["file_name"])
+        image = np.repeat(image[:, :, np.newaxis], 3, axis=2)
+        # image = np.broadcast_to(image[:, :, np.newaxis], (256, 256, 3))
+        # image = utils.read_image(dataset_dict["file_name"], format=self.img_format)
+        # 对图像进行归一化
+        # 设计随机灰度映射
+        random_low = np.random.random() * 50
+        random_up = np.random.random() * 50 + 205
+        #随机加入高斯噪声
+        noise = np.random.normal(0, 20, image.shape[0:2]).astype("float32")
+        noise = np.expand_dims(noise, axis=-1)
+        noise = np.repeat(noise, 3, -1)
+        p_1 = np.random.random()
+        if p_1 > 0.5:
+            image = image + noise
 
+        image = normalize(image.astype("float32"), lower=1.0, upper=99.0, low_value=random_low, up_value=random_up).astype("float32")
         parent_dir = "/".join(dataset_dict["file_name"].split("/")[:-2])
         utils.check_image_size(dataset_dict, image)
 
@@ -230,14 +241,6 @@ class CellinstanceDatasetMapper:
         padding_mask = np.ones(image.shape[:2])
 
         image, transforms = T.apply_transform_gens(self.tfm_gens, image)
-        #随机加入高斯噪声
-        noise = np.random.normal(0, 20, image.shape[0:2]).astype("float32")
-        noise = np.expand_dims(noise, axis=-1)
-        noise = np.repeat(noise, 3, -1)
-        v = np.random.random()
-        if v > 0.5:
-            image = image + noise
-            image = np.clip(image, 0, 255)
         # the crop transformation has default padding value 0 for segmentation
         padding_mask = transforms.apply_segmentation(padding_mask)
         padding_mask = ~ padding_mask.astype(bool)
@@ -345,6 +348,19 @@ def transform_instance_annotations(
             mask = transforms.apply_segmentation(segm)
             assert tuple(mask.shape[:2]) == image_size
             mask[mask > 0] = 1
+            kernel = np.ones((3, 3), np.uint8)
+            kernel[0,0] = 0
+            kernel[0,2] = 0
+            kernel[2,0] = 0
+            kernel[2,2] = 0
+            mask_open =  cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+            if not np.any(mask_open):
+                annotation["bbox"] = np.array([0,0,0,0], dtype=float)
+            else:
+                rows, cols = np.where(mask_open)
+                y_min, y_max = np.min(rows), np.max(rows)
+                x_min, x_max = np.min(cols), np.max(cols)
+                annotation["bbox"] = np.array([x_min, y_min, x_max, y_max], dtype=float)
             annotation["segmentation"] = mask
         else:
             raise ValueError(
