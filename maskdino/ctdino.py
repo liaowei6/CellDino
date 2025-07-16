@@ -265,8 +265,11 @@ class CtDINO(nn.Module):
         images = [x["image"].to(self.device) for x in batched_inputs]
         images = [(x - self.pixel_mean) / self.pixel_std for x in images]
         images = ImageList.from_tensors(images, self.size_divisibility)
+        padding_mask = [x["padding_mask"].to(self.device) for x in batched_inputs]
         #mask = [x["padding_mask"].to(self.device) for x in batched_inputs]
-        features = self.backbone(images.tensor)
+        #冻结encoder参数，只对Deoder进行训练
+        with torch.no_grad():
+            features = self.backbone(images.tensor)
 
         if self.training:
             # dn_args={"scalar":30,"noise_scale":0.4}
@@ -309,6 +312,8 @@ class CtDINO(nn.Module):
                 mode="bilinear",
                 align_corners=False,
             )
+            #去除填充部分
+            mask_pred_results = mask_pred_results[:, :, padding_mask[0][1]:(images.tensor.shape[-2]-padding_mask[0][3]), padding_mask[0][0]:(images.tensor.shape[-1]-padding_mask[0][2])]
             item_output["pred_masks"] = F.interpolate(
                 item_output["pred_masks"],
                 size=(images.tensor.shape[-2], images.tensor.shape[-1]),
@@ -333,9 +338,6 @@ class CtDINO(nn.Module):
                         mask_pred_result, image_size, height, width
                     )
                     mask_cls_result = mask_cls_result.to(mask_pred_result)
-                    item_output_mask = retry_if_cuda_oom(sem_seg_postprocess)(
-                        item_output["pred_masks"][i], image_size, height, width
-                    )
                     # mask_box_result = mask_box_result.to(mask_pred_result)
                     # mask_box_result = self.box_postprocess(mask_box_result, height, width)
 
@@ -355,14 +357,14 @@ class CtDINO(nn.Module):
 
                 if self.instance_on:
                     mask_box_result = mask_box_result.to(mask_pred_result)
-                    height = new_size[0]/image_size[0]*height
-                    width = new_size[1]/image_size[1]*width
+                    # height = new_size[0]/image_size[0]*height
+                    # width = new_size[1]/image_size[1]*width
                     mask_box_result = self.obbox_postprocess(mask_box_result, height, width) #(nq, 5)
                     item_box_result = self.obbox_postprocess(item_output["pred_boxes"][i], height, width) #(nq, 5)
                     # 将item中的输出加入最后的输出当中
-                    mask_box_result = torch.cat([mask_box_result, item_box_result], dim=0)
-                    mask_pred_result = torch.cat([mask_pred_result, item_output_mask], dim=0)
-                    mask_cls_result = torch.cat([mask_cls_result, item_output["pred_logits"][i]], dim=0)
+                    # mask_box_result = torch.cat([mask_box_result, item_box_result], dim=0)
+                    # mask_pred_result = torch.cat([mask_pred_result, item_output["pred_masks"][i]], dim=0)
+                    # mask_cls_result = torch.cat([mask_cls_result, item_output["pred_logits"][i]], dim=0)
                     if self.duplicate:
                         # instance_r = retry_if_cuda_oom(self.instance_inference_cell)(mask_cls_result, mask_pred_result, mask_box_result)
                         #instance_r = retry_if_cuda_oom(self.instance_inference)(mask_cls_result, mask_pred_result, mask_box_result)
@@ -592,12 +594,12 @@ class CtDINO(nn.Module):
         angle_scale = torch.tensor([1,1,1,1,90], device=mask_box_result.device)
         mask_box_result_return = mask_box_result / angle_scale
         mask_box_result_return = box_ops.scale_obbox(mask_box_result_return, torch.tensor([1/image_size[0], 1/image_size[1]], dtype=float, device=mask_box_result_return.device), norm_angle= True)
-        mask_box_result_per_image, scores_per_image, labels_per_image, index = box_ops.multiclass_nms_rotated(mask_box_result.squeeze(0), scores.squeeze(0), 0.2, 0.45, return_inds=True) 
+        mask_box_result_per_image, scores_per_image, labels_per_image, index = box_ops.multiclass_nms_rotated(mask_box_result.squeeze(0), scores.squeeze(0), 0.2, 0.5, return_inds=True) 
         result = Instances(image_size)
         # 过滤掉有小面积较小的检测：
         valid_index = []
         for i in index:
-            if mask_box_result_return[i][2] * mask_box_result_return[i][3] > 0.001:
+            if mask_box_result_return[i][2] * mask_box_result_return[i][3] > 0.00001:
                 valid_index.append(i)
         index = torch.tensor(valid_index, device=index.device)
         mask_box_result = mask_box_result[index]

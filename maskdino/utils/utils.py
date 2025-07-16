@@ -5,9 +5,11 @@ import os
 from typing import Any, Iterator, List, Union, Tuple
 import math
 import torch.nn.functional as F
+import torchvision.ops as ops
 from torch import nn
 import numpy as np
 import cv2
+from .box_ops import box_cxcywh_to_xyxy
 class BitMasks_ct:
     """
     This class stores the segmentation masks for all objects in one image, in
@@ -118,6 +120,15 @@ class BitMasks_ct:
                         else:
                             rect = [r[0][0], r[0][1], r[1][1], r[1][0], (90 - r[2])]
                         area_max = area
+                #对于SIM+数据集，如果多个不连接的掩码则取包含所有的外接矩形
+                # contour = contours[0]
+                # for i in range(1, len(contours)):
+                #     contour = np.concatenate((contour, contours[i]), axis=0)
+                # r = cv2.minAreaRect(contour.astype(np.float32))
+                # if norm:
+                #     rect = [r[0][0], r[0][1], r[1][1], r[1][0], (90 - r[2]) / 90.0]  #(x, y, w, h, theta)
+                # else:
+                #     rect = [r[0][0], r[0][1], r[1][1], r[1][0], (90 - r[2])]
                 # 获取最小外接矩形
                 # contours = contours[0].astype(np.float32)
                 # r = cv2.minAreaRect(contours)
@@ -127,6 +138,55 @@ class BitMasks_ct:
                 #     rect = [r[0][0], r[0][1], r[1][0], r[1][1], r[2] / 90.0]  #(x, y, w, h, theta)
             else:
                 rect = [0.0, 0.0, 0.0, 0.0, 0.0]
+            rectangles.append(rect)
+        rectangles = np.array(rectangles)
+        rectangles = torch.from_numpy(rectangles)
+        return rectangles
+
+    def get_oriented_bounding_boxes_crop(self, mask_center, norm=True) -> torch.Tensor:
+        """
+        Returns:
+            Boxes: tight bounding boxes around bitmasks.
+            If a mask is empty, it's bounding box will be all zero.
+        """
+        boxes = torch.zeros(self.tensor.shape[0], 4, dtype=torch.float32)
+        rectangles = []
+        mask_np = self.tensor.cpu().numpy().astype(np.uint8)
+        h, w = mask_np.shape[-2:]
+        mask_center = mask_center.cpu().numpy()
+        for i in range(mask_np.shape[0]):
+            # 将当前mask转换为二值图像
+            binary = (mask_np[i] > 0).astype(np.uint8)
+            kernel = np.ones((3, 3), np.uint8)
+            kernel[0,0] = 0
+            kernel[0,2] = 0
+            kernel[2,0] = 0
+            kernel[2,2] = 0
+            binary_open =  cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+            # 查找轮廓
+            contours, _ = cv2.findContours(binary_open, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if len(contours) > 0:
+                #对于有多个外接矩形的mask取面积最大的哪一个作为斜方框
+                area_max = 0
+                for contour in contours:
+                    r = cv2.minAreaRect(contour.astype(np.float32))
+                    area = r[1][0] * r[1][1]
+                    if area > area_max:
+                        if norm:
+                            rect = [r[0][0], r[0][1], r[1][1], r[1][0], (90 - r[2]) / 90.0]  #(x, y, w, h, theta)
+                        else:
+                            rect = [r[0][0], r[0][1], r[1][1], r[1][0], (90 - r[2])]
+                        area_max = area
+                # 获取最小外接矩形
+                # contours = contours[0].astype(np.float32)
+                # r = cv2.minAreaRect(contours)
+                # if r[2] == 90:
+                #     rect = [r[0][0], r[0][1], r[1][1], r[1][0], 0]
+                # else:
+                #     rect = [r[0][0], r[0][1], r[1][0], r[1][1], r[2] / 90.0]  #(x, y, w, h, theta)
+            else:
+                rect = [0.0, 0.0, 0.0, 0.0, 0.0]
+            rect[:2] = rect[:2] + mask_center[i] - [w/2, h/2]
             rectangles.append(rect)
         rectangles = np.array(rectangles)
         rectangles = torch.from_numpy(rectangles)
@@ -429,7 +489,9 @@ def gen_encoder_output_proposals_ct(memory:Tensor, memory_padding_mask:Tensor, s
 
         scale = torch.cat([valid_W.unsqueeze(-1), valid_H.unsqueeze(-1)], 1).view(N_, 1, 1, 2)
         grid = (grid.unsqueeze(0).expand(N_, -1, -1, -1) + 0.5) / scale
-        wh = torch.ones_like(grid) * 0.05 * (2.0 ** lvl)
+        wh = torch.ones_like(grid) * 0.05 * (2.0 ** lvl)   #原来的
+        # wh = torch.ones_like(grid) * 0.01 * (2.0 ** lvl)   #针对psc数据集
+        # wh = torch.ones_like(grid) * 0.1 * (2.0 ** lvl)  #针对msc数据集
         proposal = torch.cat((grid, wh), -1).view(N_, -1, 4)
         #TODO 初始化角度时均匀初始化，而不是全为一个值
         theta = torch.full([N_, proposal.shape[1], 1], 0.5, device=proposal.device)
@@ -512,3 +574,88 @@ def _get_clones(module, N, layer_share=False):
         return nn.ModuleList([module for i in range(N)])
     else:
         return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
+
+def get_rotated_rect_vertices(obboxes):
+    # obboxes  (x,y,w,h, \theta) 全部都是归一化后的结果
+    obboxes = obboxes.transpose(0,1)
+    obboxes[:, :, 4] = obboxes[: ,:, 4] * math.pi / 2
+    x = obboxes[:, :, 0]
+    y = obboxes[:, :, 1]
+    w = obboxes[:, :, 2]
+    h = obboxes[:, :, 3]
+    a = - obboxes[:, :, 4]
+    cosa = torch.cos(a)
+    sina = torch.sin(a)
+    wx, wy = w / 2 * cosa, w / 2 * sina
+    hx, hy = -h / 2 * sina, h / 2 * cosa
+    p1x, p1y = x - wx - hx, y - wy - hy
+    p2x, p2y = x + wx - hx, y + wy - hy
+    p3x, p3y = x + wx + hx, y + wy + hy
+    p4x, p4y = x - wx + hx, y - wy + hy
+    point_x = torch.stack([p1x, p2x, p3x, p4x], dim=2)
+    point_y = torch.stack([p1y, p2y, p3y, p4y], dim=2)
+    min_x = torch.min(point_x, dim=2).values  
+    max_x = torch.max(point_x, dim=2).values
+    min_y = torch.min(point_y, dim=2).values
+    max_y = torch.max(point_y, dim=2).values
+    widths = max_x - min_x
+    heights = max_y - min_y
+    return torch.max(widths), torch.max(heights)
+
+def convert_boxes_to_roi_format(boxes):
+    """
+    将形状为 [B, N, 4] 的边界框转换为 ROIAlign 所需的 [R, 5] 格式
+    :param boxes: 边界框，形状为 [B, N, 4]
+    :param batch_size: 批量大小 B
+    :return: 转换后的边界框，形状为 [R, 5]
+    """
+    B, N, _ = boxes.shape
+    R = B * N
+
+    # 展平边界框
+    boxes_flat = boxes.view(R, 4)
+
+    # 创建批次索引
+    batch_indices = torch.arange(B, dtype=torch.float32, device=boxes.device).view(B, 1).expand(B, N).contiguous().view(R, 1)
+
+    # 将批次索引添加到边界框前面
+    rois = torch.cat([batch_indices, boxes_flat], dim=1)
+
+    return rois
+
+def extract_region_features(feature_map, centers, w, h):
+    """
+    从特征图中提取以一组中心点为中心、宽度为 w、高度为 h 的区域特征，填充超出边界的区域
+    :param feature_map: 输入特征图 (B, C, H, W)
+    :param centers: 中心点坐标 (N, B, 2)
+    :param w: 区域宽度
+    :param h: 区域高度
+    :return: 提取的区域特征 (N, C, h, w)
+    """
+    B, C, H, W = feature_map.shape
+    centers = centers.transpose(0, 1)
+    _, N, _ = centers.shape
+
+    # 将归一化的中心点和宽高转换为特征图上的实际坐标
+    centers_actual = centers * torch.tensor([W, H], device=centers.device).view(1, 1, 2)
+    w_actual = int(w * W) + 1
+    h_actual = int(h * H) + 1
+
+    # 计算填充大小
+    pad_left = max(0, int(-torch.min(centers_actual[..., 0] - w_actual // 2))+1)
+    pad_right = max(0, int(torch.max(centers_actual[..., 0] + w_actual // 2 - W))+1)
+    pad_top = max(0, int(-torch.min(centers_actual[..., 1] - h_actual // 2))+1)
+    pad_bottom = max(0, int(torch.max(centers_actual[..., 1] + h_actual // 2 - H))+1)
+
+    # 对特征图进行填充
+    feature_map_padded = F.pad(feature_map, (pad_left, pad_right, pad_top, pad_bottom), mode='constant', value=0)
+
+    # 调整中心点坐标
+    centers_padded = centers_actual + torch.tensor([pad_left, pad_top], device=centers_actual.device).view(1, 1, 2)
+    # 转换为边框
+    crop_boxes = torch.cat([centers_padded, torch.tensor([w_actual, h_actual], device=centers_padded.device).view(1, 1, 2).expand(B, N, 2)], dim=-1)
+    crop_boxes = box_cxcywh_to_xyxy(crop_boxes)
+    crop_boxes = convert_boxes_to_roi_format(crop_boxes)
+    #采用ROI_ALIGN获取区域特征
+    roi_features = ops.roi_align(feature_map_padded, crop_boxes.to(torch.float32), (h_actual, w_actual))
+    return roi_features.view(B, N, C, int(h_actual), int(w_actual))

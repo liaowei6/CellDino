@@ -252,7 +252,7 @@ class MaskDINO(nn.Module):
         images = [x["image"].to(self.device) for x in batched_inputs]
         images = [(x - self.pixel_mean) / self.pixel_std for x in images]
         images = ImageList.from_tensors(images, self.size_divisibility)
-
+        padding_mask = [x["padding_mask"].to(self.device) for x in batched_inputs]
         features = self.backbone(images.tensor)
 
         if self.training:
@@ -289,7 +289,8 @@ class MaskDINO(nn.Module):
                 mode="bilinear",
                 align_corners=False,
             )
-
+            #去除填充部分
+            mask_pred_results = mask_pred_results[:, :, padding_mask[0][1]:(images.tensor.shape[-2]-padding_mask[0][3]), padding_mask[0][0]:(images.tensor.shape[-1]-padding_mask[0][2])]
             del outputs
 
             processed_results = []
@@ -512,7 +513,7 @@ class MaskDINO(nn.Module):
         scores = scores[index]
         pred_masks = pred_masks[index]
         # 进行nms
-        index = nms(mask_box_result, scores, 1.0) 
+        index = nms(mask_box_result, scores, 0.5) 
         result = Instances(image_size)
         # 过滤掉有小面积较小的检测：
         # valid_index = []

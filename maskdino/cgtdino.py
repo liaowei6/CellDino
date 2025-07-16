@@ -57,6 +57,8 @@ class CgtDINO(nn.Module):
         semantic_ce_loss: bool = False,
         duplicate: bool = False,
         crop: bool = False,
+        simi: bool = False,
+        dq: bool = False,
     ):
         """
         Args:
@@ -88,6 +90,15 @@ class CgtDINO(nn.Module):
         self.backbone = backbone
         self.pano_temp = pano_temp
         self.sem_seg_head = sem_seg_head
+        #冻结部分权重只训练预测头和相关层权重
+        # 冻结所有层的权重
+        # for param in self.sem_seg_head.parameters():
+        #     param.requires_grad = False
+        # self.sem_seg_head.predictor.class_embed.weighs.requires_grad = True
+        # self.sem_seg_head.predictor.class_embed.bias.requires_grad = True
+        # self.sem_seg_head.predictor.label_enc.weights.requires_grad = True
+        # self.sem_seg_head.predictor.label_enc.bias.requires_grad = True
+
         self.criterion = criterion
         self.num_queries = num_queries
         self.overlap_threshold = overlap_threshold
@@ -113,6 +124,8 @@ class CgtDINO(nn.Module):
         self.semantic_ce_loss = semantic_ce_loss
         self.duplicate = duplicate
         self.crop = crop
+        self.simi = simi
+        self.dq = dq
         if not self.semantic_on:
             assert self.sem_seg_postprocess_before_inference
 
@@ -140,6 +153,12 @@ class CgtDINO(nn.Module):
         giou_weight = cfg.MODEL.MaskDINO.GIOU_WEIGHT  #
         motion_weight = cfg.MODEL.MaskDINO.MOTION_WEIGHT
         motion_cls_weight = cfg.MODEL.MaskDINO.MOTION_CLS_WEIGHT
+        # img_lst_weight = cfg.MODEL.MaskDINO.IMG_LST_WEIGHT
+        # fea_lst_weight = cfg.MODEL.MaskDINO.FEA_LST_WEIGHT
+        # lcm_weight = cfg.MODEL.MaskDINO.LCM_WEIGHT
+        # deep_lst_weight = cfg.MODEL.MaskDINO.DEEP_LST_WEIGHT
+        # area_weight = cfg.MODEL.MaskDINO.AREA_WEIGHT
+        # energy_weight = cfg.MODEL.MaskDINO.ENERGY_WEIGHT
         # building matcher
         matcher = HungarianMatcher(
             cost_class=cost_class_weight,
@@ -154,6 +173,8 @@ class CgtDINO(nn.Module):
         weight_dict.update({"loss_mask": mask_weight, "loss_dice": dice_weight})
         weight_dict.update({"loss_bbox":box_weight,"loss_giou":giou_weight})
         weight_dict.update({"loss_motion":motion_weight, "loss_motion_cls":motion_cls_weight})
+        weight_dict.update({'loss_ce_dq': 1})
+       # weight_dict.update({"loss_img_lst": img_lst_weight, "loss_fea_lst": fea_lst_weight, "loss_lcm": lcm_weight, "loss_deep_lst": deep_lst_weight, "loss_area": area_weight, "loss_energy": energy_weight})
         # two stage is the query selection scheme
         if cfg.MODEL.MaskDINO.TWO_STAGE:
             interm_weight_dict = {}
@@ -172,6 +193,10 @@ class CgtDINO(nn.Module):
             dn_losses=["labels", "masks","oboxes"]
         else:           
             dn_losses=[]
+        if cfg.TRACK:
+            track_weight_dict = {}
+            track_weight_dict.update({k + f'_track': v for k, v in weight_dict.items()})
+            weight_dict.update(track_weight_dict)
         if deep_supervision:
             dec_layers = cfg.MODEL.MaskDINO.DEC_LAYERS
             aux_weight_dict = {}
@@ -204,6 +229,7 @@ class CgtDINO(nn.Module):
             live_cell= cfg.INPUT.LIVE_CELL,
             num_gt_points = cfg.MODEL.MaskDINO.TRAIN_GT_POINTS,
             crop = cfg.CROP,
+            simi = cfg.SIMI,
         )
         
         return {
@@ -234,6 +260,8 @@ class CgtDINO(nn.Module):
             "semantic_ce_loss": cfg.MODEL.MaskDINO.TEST.SEMANTIC_ON and cfg.MODEL.MaskDINO.SEMANTIC_CE_LOSS and not cfg.MODEL.MaskDINO.TEST.PANOPTIC_ON,
             "duplicate": cfg.MODEL.MaskDINO.DUPLICATE_BOX_MATCHING,
             "crop": cfg.CROP,
+            "simi": cfg.SIMI,
+            "dq": cfg.DQ,
         }
 
     @property
@@ -270,9 +298,11 @@ class CgtDINO(nn.Module):
         images = [x["image"].to(self.device) for x in batched_inputs]  #batch
         images = [(x - self.pixel_mean) / self.pixel_std for x in images]
         images = ImageList.from_tensors(images, self.size_divisibility)
-        #mask = [x["padding_mask"].to(self.device) for x in batched_inputs]
+        padding_mask = [x["padding_mask"].to(self.device) for x in batched_inputs]
 
-        features = self.backbone(images.tensor)
+        #冻结encoder参数，只对Deoder进行训练
+        with torch.no_grad():
+            features = self.backbone(images.tensor)
 
         if self.training:
             # dn_args={"scalar":30,"noise_scale":0.4}
@@ -280,89 +310,152 @@ class CgtDINO(nn.Module):
             if "instances" in batched_inputs[0]:
                 gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
                 moists = [x["moists"] for x in batched_inputs]
+                #计算动态查询数量
+                if self.dq:
+                    ccm_targets = []
+                    ccm_params = [100, 300, 500]
+                    for i in range(len(gt_instances)):
+                        tgt_num = gt_instances[i].gt_classes.shape[0]
+                        t = 0
+                        for j in range(len(ccm_params)):
+                            if tgt_num >= ccm_params[j]:
+                                t = j + 1
+                    ccm_targets.append(t) 
+                    ccm_targets = torch.tensor(ccm_targets, dtype=torch.int64).to("cuda")
+                    self.num_queries = ccm_params[torch.max(ccm_targets).item()]
                 if "live_cell" in self.data_loader:
                      targets = self.prepare_targets_live_cell(gt_instances, images)
                 elif 'detr' in self.data_loader:
                     if self.crop:
                         targets = self.prepare_targets_crop(gt_instances, images)
+                    elif self.simi and not tracker.reverse:
+                        # norm_images = [x["norm_image"].to(self.device) for x in batched_inputs]
+                        # targets = self.prepare_targets_simi(gt_instances, images, moists, tracker, norm_images) 对于采用水平集损失
+                        targets = self.prepare_targets_detr(gt_instances, images, moists, tracker)
                     else:
                         targets = self.prepare_targets_detr(gt_instances, images, moists, tracker) #对边框进行归一化，角度没有进行归一化
                 else:
                     targets = self.prepare_targets(gt_instances, images)
             else:
                 targets = None
-            outputs, mask_dict = self.sem_seg_head(features ,targets=targets, tracker=tracker)
-            # bipartite matching-based loss
-            losses = self.criterion(outputs, targets, mask_dict, is_track=True, tracker=tracker)
-
-            for k in list(losses.keys()):
-                if k in self.criterion.weight_dict:
-                    losses[k] *= self.criterion.weight_dict[k]
-                else:
-                    # remove this loss if not specified in `weight_dict`
-                    losses.pop(k)
+            outputs, mask_dict = self.sem_seg_head(features, targets=targets, tracker=tracker)
+            if tracker.pseudo:
+                losses, pseudo_targets = self.criterion(outputs, targets, mask_dict, is_track=True, tracker=tracker)
+                return pseudo_targets
+            else:   
+                losses = self.criterion(outputs, targets, mask_dict, is_track=True, tracker=tracker)
+                for k in list(losses.keys()):
+                    if k in self.criterion.weight_dict:
+                        losses[k] *= self.criterion.weight_dict[k]
+                    else:
+                     # remove this loss if not specified in `weight_dict`
+                        losses.pop(k)
+                #ccm loss
+            if self.dq:
+                CCM_LOSS = torch.nn.CrossEntropyLoss()
+                loss_ccm = CCM_LOSS(outputs["counting_output"], ccm_targets)
+                losses['loss_ccm'] = loss_ccm * 1.0 
+                # with open("num_acc.txt", "a", encoding="utf-8") as file:
+                #     file.write(f"{outputs['num_select']} {ccm_params[ccm_targets]}\n")  # 写入 "a b" 并换行
             return losses
         else:
             outputs, _ = self.sem_seg_head(features, tracker=tracker)
+            if self.dq:
+                self.num_queries = outputs["num_select"]
             mask_cls_results = outputs["pred_logits"]
             mask_pred_results = outputs["pred_masks"]
             mask_box_results = outputs["pred_boxes"]
             mask_query = outputs["query"]
             # test
-            item_output = outputs["interm_outputs"]
+            #item_output = outputs["interm_outputs"]
             track_id = torch.tensor([], dtype=torch.int64)
+            tracked_index = []
+            min_center_distance = []
             # 对追踪query进行处理
+            # print("-----" + str(tracker.frame_index) + "------")
+            # print(tracker.track_ids)
             if tracker.track_num > 0:
+                #超参数设置
+                moist_min_area = tracker.moist_min_area
+                track_min_area = tracker.track_min_area
+                min_distance = tracker.moist_min_center_distance
+                max_distance = tracker.moist_max_center_distance
                 t_o_thresh = tracker.track_obj_score_thresh
                 track_num = tracker.track_num
                 track_cls_results = mask_cls_results[:, self.num_queries:, :].sigmoid()
                 track_box_results = mask_box_results[:, self.num_queries:, :]
                 track_pred_results = mask_pred_results[:, self.num_queries:, :, :]
                 index = []
-                un_track_index = []  #首次检测到的追踪轨迹
                 track_id = []
                 track_query = mask_query[:, self.num_queries:, :]
-                iou = 1 - kfiou_loss(track_box_results[0, :track_num, :], track_box_results[0, track_num:, :])
+                angle_convert = torch.tensor([1.0, 1.0, 1.0, 1.0, math.pi / 2.0], device= track_box_results.device)
+                first_boxes_results= track_box_results[0, :track_num, :] * angle_convert
+                second_boxes_results = track_box_results[0, track_num:, :] * angle_convert
+                iou = box_iou_rotated(first_boxes_results.float(), second_boxes_results.float(), aligned=True)  #无法做到完全精确,即对于某些旋转边框,即是完全相同也计算出也为0
+                #采用中心点之间的距离来辅助判断
+                # 计算欧氏距离  
+                diff = first_boxes_results[:, :2] - second_boxes_results[:, :2]  # 计算差值
+                center_distance = torch.sqrt(torch.sum(diff ** 2, dim=-1))  # 计算欧氏距离 
                 max_index = track_cls_results[:, :track_num, 0] - track_cls_results[:, track_num:, 0]
                 max_index = max_index.squeeze(0)
-                max_index[max_index > 0] = 1
-                max_index[max_index < 0] = 0
+                max_index[max_index > 0] = 0
+                max_index[max_index < 0] = 1
                 track_index = torch.arange(0, track_num).to(max_index.device)
                 track_index = track_index + max_index * track_num
                 track_index = track_index.long()
                 # angle_convert = torch.tensor([1.0, 1.0, 1.0, 1.0, math.pi / 2.0], device= mask_box_results.device)
                 for i in range(track_num):
-                    if track_cls_results[0, i, 0] > t_o_thresh and track_cls_results[0, i + track_num, 0] > t_o_thresh:
+                    #if tracker.dataset=="DIC-C2DH-HeLa" and tracker.dataset_index=="01_RES" and tracker.track_ids[i]==20 and tracker.frame_index==75:
+                    if tracker.dataset=="DIC-C2DH-HeLa" and tracker.dataset_index=="01_RES" and ((tracker.track_ids[i]==23 and tracker.frame_index==75) or (tracker.track_ids[i]==2 and tracker.frame_index==111)):
+                        tracker.track_to_lost(tracker.tracks[i] ,tracker.frame_index)
+                        continue
+                    if track_cls_results[0, i, 0] > t_o_thresh and track_cls_results[0, i + track_num, 0] > t_o_thresh  and track_box_results[0, i, 2] * track_box_results[0][i][3] > moist_min_area and track_box_results[0, i+track_num, 2] * track_box_results[0][i+track_num][3] > moist_min_area:
                         #未发生分裂
-                        #tracker.track_nms_thresh = 0.5
-                        if iou[i] > tracker.track_nms_thresh:
-                            tracker.tracks[i].update(track_query[0, track_index[i], :], track_box_results[0, track_index[i], :], track_cls_results[0, track_index[i], :])
-                            index.append(track_index[i])
-                            track_id.append(tracker.tracks[i].id)
-                        #发生分裂
-                        else:
-                            if track_box_results[0, i, 2] * track_box_results[0][i][3] > 0.005 and track_box_results[0, i+track_num, 2] * track_box_results[0][i+track_num][3] > 0.005:
-                                tracker.tracks[i].lost(tracker.frame_index)
-                                tracker.add_track(track_box_results[0, i, :], track_cls_results[0, i, :] ,track_query[0, i, :], tracker.tracks[i].id)
-                                tracker.add_track(track_box_results[0, i+track_num, :], track_cls_results[0, i+track_num, :] ,track_query[0, i+track_num, :], tracker.tracks[i].id)          
+                        if iou[i] > tracker.track_nms_thresh or center_distance[i] < min_distance or center_distance[i] > max_distance:
+                            if tracker.tracks[i].state==0:
                                 index.append(i)
-                                index.append(i + track_num)
-                                track_id.append(tracker.tracks[-2].id)
+                                tracker.track_to_active(tracker.tracks[i], track_query[0, i, :], track_cls_results[0, i, :], track_box_results[0, i, :])
                                 track_id.append(tracker.tracks[-1].id)
-                                print(tracker.tracks[i].id,(tracker.tracks[-2].id, tracker.tracks[-1].id))
+                                tracked_index.append(len(tracker.tracks) -1)
                             else:
-                                tracker.tracks[i].update(track_query[0, track_index[i], :], track_box_results[0, track_index[i], :], track_cls_results[0, track_index[i], :])
                                 index.append(track_index[i])
                                 track_id.append(tracker.tracks[i].id)
-                    elif track_cls_results[0, track_index[i], 0] >= t_o_thresh:
+                                tracked_index.append(i)                            
+                        #发生分裂
+                        else:
+                            tracker.track_to_lost(tracker.tracks[i],tracker.frame_index)
+                            tracker.add_track(track_box_results[0, i, :], track_cls_results[0, i, :] ,track_query[0, i, :], tracker.tracks[i].id)
+                            tracker.add_track(track_box_results[0, i+track_num, :], track_cls_results[0, i+track_num, :] ,track_query[0, i+track_num, :], tracker.tracks[i].id)          
+                            index.append(i)
+                            index.append(i + track_num)
+                            track_id.append(tracker.tracks[-2].id)
+                            track_id.append(tracker.tracks[-1].id)
+                            tracked_index.append(len(tracker.tracks) -2)
+                            tracked_index.append(len(tracker.tracks) -1)
+                            # print("分裂：")
+                            # print(tracker.tracks[i].id,(tracker.tracks[-2].id, tracker.tracks[-1].id))
+                            # print(iou[i])
+                            # print(center_distance[i])
+                    elif track_cls_results[0, track_index[i], 0] >= t_o_thresh - 0.1 and track_box_results[0, track_index[i], 2] * track_box_results[0, track_index[i], 3] >= track_min_area:
+                        if tracker.tracks[i].state==0:
+                            index.append(i)
+                            tracker.track_to_active(tracker.tracks[i], track_query[0, i, :], track_cls_results[0, i, :], track_box_results[0, i, :])
+                            track_id.append(tracker.tracks[-1].id)
+                            tracked_index.append(len(tracker.tracks) -1)
                         #正常追踪
-                        tracker.tracks[i].update(track_query[0, track_index[i], :], track_box_results[0, track_index[i], :], track_cls_results[0, track_index[i], :])
-                        index.append(track_index[i])
-                        track_id.append(tracker.tracks[i].id)
+                        else:
+                            tracked_index.append(i)
+                            index.append(track_index[i])
+                            track_id.append(tracker.tracks[i].id)
                     else:
                         #追踪失败，
                         # un_track_index.append(track_index[i])
+                        # print("丢失：")
+                        # print(tracker.tracks[i].id)
+                        # print(track_cls_results[0, track_index[i], 0])
+                        # print(track_box_results[0, track_index[i]])
                         if (tracker.tracks[i].state == 0 and tracker.tracks[i].count_inactive >= tracker.inactive_patience) or tracker.tracks[i].state == 3:
+                        #if  tracker.tracks[i].count_inactive >= tracker.inactive_patience or tracker.tracks[i].state == 3:
                             tracker.track_to_lost(tracker.tracks[i] ,tracker.frame_index)
                         elif tracker.tracks[i].state == 0:
                             tracker.tracks[i].count_inactive += 1
@@ -371,37 +464,39 @@ class CgtDINO(nn.Module):
                 # 已追踪到的轨迹index
                 index = torch.tensor(index, device=track_query.device).long()
                 index = (torch.zeros_like(index, device=index.device, dtype=torch.int64), index)
-                # 未追踪到的轨迹index
-                # un_track_index = torch.tensor(un_track_index, device=track_query.device).long()
-                # un_track_index = (torch.zeros_like(un_track_index, device=un_track_index.device, dtype=torch.int64), un_track_index)
-                #未追踪到的轨迹
-                # un_track_box_results = track_box_results[un_track_index]
-                # un_track_query = track_query[un_track_index]
-                # un_track_cls_results = track_cls_results[un_track_index]
                 #追踪到的轨迹
                 track_query = track_query[index].unsqueeze(0)
                 track_box_results = track_box_results[index].unsqueeze(0)
                 track_cls_results = track_cls_results[index].unsqueeze(0)
                 track_pred_results = track_pred_results[index].unsqueeze(0)
-                track_cls_results[:, :, 0] = 1
+                track_cls_results[:, :, 0] = 10.0 + track_cls_results[:, :, 0]
                 track_id = torch.tensor(track_id, dtype=torch.int64)
                 mask_cls_results = torch.cat([mask_cls_results[:, :self.num_queries], track_cls_results], dim=1)
                 mask_box_results = torch.cat([mask_box_results[:, :self.num_queries], track_box_results], dim=1)
                 mask_pred_results = torch.cat([mask_pred_results[:, :self.num_queries], track_pred_results], dim=1)
                 mask_query = torch.cat([mask_query[:, :self.num_queries], track_query], dim=1)
             # upsample masks
-            mask_pred_results = F.interpolate(
+            mask_center = None
+            if self.crop:
+                #每一个查询分割一小块区域,记录每个区域的中心点位置
+                mask_pred_results = F.interpolate(
+                    mask_pred_results,
+                    size=(4*mask_pred_results.shape[-2], 4*mask_pred_results.shape[-1]),
+                    mode="bilinear", 
+                    align_corners=False,
+                )
+                mask_center = mask_box_results[:, :, :2]  #(B， Q， 2)
+                mask_center = mask_center * torch.tensor([images.tensor.shape[-1], images.tensor.shape[-2]], device=mask_center.device)
+                mask_center = mask_center - torch.tensor([padding_mask[0][0], padding_mask[0][1]], device=mask_center.device)
+            else:
+                mask_pred_results = F.interpolate(
                 mask_pred_results,
                 size=(images.tensor.shape[-2], images.tensor.shape[-1]),
                 mode="bilinear",
                 align_corners=False,
-            )
-            # item_output["pred_masks"] = F.interpolate(
-            #     item_output["pred_masks"],
-            #     size=(images.tensor.shape[-2], images.tensor.shape[-1]),
-            #     mode="bilinear",
-            #     align_corners=False,
-            # )
+                )
+                #去除填充部分
+                mask_pred_results = mask_pred_results[:, :, padding_mask[0][1]:(images.tensor.shape[-2]-padding_mask[0][3]), padding_mask[0][0]:(images.tensor.shape[-1]-padding_mask[0][2])]
             del outputs
             i = 0
             processed_results = []
@@ -411,16 +506,25 @@ class CgtDINO(nn.Module):
                 height = input_per_image.get("height", image_size[0])  # real size
                 width = input_per_image.get("width", image_size[1])
                 processed_results.append({})
-                new_size = mask_pred_result.shape[-2:]  # padded size (divisible to 32)
+                if self.crop:
+                    new_size = image_size          
+                else:
+                    new_size = mask_pred_result.shape[-2:]  # padded size (divisible to 32)
 
                 all_id = torch.zeros(len(mask_box_result), dtype=torch.int64)
                 all_id[self.num_queries:] = track_id
 
                 if self.sem_seg_postprocess_before_inference:
                     # 还原至原来大小
-                    mask_pred_result = retry_if_cuda_oom(sem_seg_postprocess)(
-                        mask_pred_result, image_size, height, width
-                    )
+                    if not self.crop:
+                        mask_pred_result = retry_if_cuda_oom(sem_seg_postprocess)(
+                            mask_pred_result, image_size, height, width
+                        )
+                    else:
+                        mask_pred_result = retry_if_cuda_oom(sem_seg_postprocess)(
+                            mask_pred_result, image_size, int(height / (image_size[0]-padding_mask[0][1]-padding_mask[0][3]) * mask_pred_result.shape[-2]), int(width / (image_size[1]-padding_mask[0][0]-padding_mask[0][2]) * mask_pred_result.shape[-1])
+                        )
+                        mask_center = mask_center[0] * torch.tensor([width / (image_size[1]-padding_mask[0][0]-padding_mask[0][2]), height / (image_size[0]-padding_mask[0][1]-padding_mask[0][3])], device=mask_center.device)  #(q, 2)
                     mask_cls_result = mask_cls_result.to(mask_pred_result)
                     # mask_box_result = mask_box_result.to(mask_pred_result)
                     # mask_box_result = self.box_postprocess(mask_box_result, height, width)
@@ -441,11 +545,11 @@ class CgtDINO(nn.Module):
 
                 if self.instance_on:
                     mask_box_result = mask_box_result.to(mask_pred_result)
-                    height = new_size[0]/image_size[0]*height
-                    width = new_size[1]/image_size[1]*width
+                    # height = new_size[0]/image_size[0]*height
+                    # width = new_size[1]/image_size[1]*width
                     # mask_box_result_orgin = mask_box_result #归一化的边框
+                    #TODO 边框的缩放未减去padding部分
                     mask_box_result = self.obbox_postprocess(mask_box_result, height, width) #(nq, 5)
-                    # item_box_result = self.obbox_postprocess(item_output["pred_boxes"][i], height, width) #(nq, 5)
                     if self.duplicate:
                         # instance_r = retry_if_cuda_oom(self.instance_inference_cell)(mask_cls_result, mask_pred_result, mask_box_result)
                         # instance_r = retry_if_cuda_oom(self.instance_inference)(mask_cls_result, mask_pred_result, mask_box_result)
@@ -453,38 +557,108 @@ class CgtDINO(nn.Module):
                         #instance_i = retry_if_cuda_oom(self.instance_inference)(item_output["pred_logits"][i], item_output["pred_masks"][i], item_box_result)     
                     else:
                         #instance_r = retry_if_cuda_oom(self.instance_inference)(mask_cls_result, mask_pred_result, mask_box_result)
-                        instance_r, index, mask_box_result_return = retry_if_cuda_oom(self.instance_inference_nms)(mask_cls_result, mask_pred_result, mask_box_result)
+                        instance_r, index, mask_box_result_return = retry_if_cuda_oom(self.instance_inference_nms)(mask_cls_result, mask_pred_result, mask_box_result, tracker.detection_obj_score_thresh, tracker.detection_nms_thresh, (int(height), int(width)),self.crop, mask_center)
                         #instance_r = retry_if_cuda_oom(self.instance_inference_cell)(mask_cls_result, mask_pred_result, mask_box_result)
-                        # instance_i = retry_if_cuda_oom(self.instance_inference)(item_output["pred_logits"][i], item_output["pred_masks"][i], item_box_result)     
+                        #instance_i = retry_if_cuda_oom(self.instance_inference)(item_output["pred_logits"][i], item_output["pred_masks"][i], item_box_result)     
+                    #对追踪轨迹进行状态更新：
+                    index_track = index[index >= self.num_queries] - self.num_queries
+                    #由于box为归一化的边框，而在下一帧进行追踪时特征图是进行了padding的，所以需要将边框缩放到填充之后的大小，只需要对中心点进行缩放
+                    mask_box_result_return[:, :2] = (mask_box_result_return[:, :2] * torch.tensor([width, height], device=mask_box_result_return.device) + torch.tensor([padding_mask[0][0], padding_mask[0][1]], device=mask_box_result_return.device)) / torch.tensor([width+padding_mask[0][0]+padding_mask[0][2], height+padding_mask[0][1]+padding_mask[0][3]], device=mask_box_result_return.device)
+                    for i in range(len(tracked_index)):
+                        if i in index_track :
+                            tracker.tracks[tracked_index[i]].update(track_query[0, i, :], mask_box_result_return[i + self.num_queries, :], track_cls_results[0, i, :])
+                        else :
+                            # print("由于面积或IOU导致丢失:")
+                            # print(tracker.tracks[tracked_index[i]].id)
+                            # print(track_box_results[0, i, 2] * track_box_results[0, i, 3])
+                            if (tracker.tracks[tracked_index[i]].state == 0 and tracker.tracks[tracked_index[i]].count_inactive >= tracker.inactive_patience): #patience=5
+                            #if (tracker.tracks[tracked_index[i]].count_inactive >= tracker.inactive_patience) or tracker.tracks[tracked_index[i]].state == 3:  #patience=1
+                                tracker.track_to_lost(tracker.tracks[tracked_index[i]] ,tracker.frame_index)
+                            elif tracker.tracks[tracked_index[i]].state == 3:
+                                if tracker.tracks[tracked_index[i]].start_frame == tracker.frame_index:
+                                    tracker.tracks[tracked_index[i]].state = 2
+                                else:
+                                    tracker.track_to_lost(tracker.tracks[tracked_index[i]] ,tracker.frame_index)
+                            elif tracker.tracks[tracked_index[i]].state == 0:
+                                tracker.tracks[tracked_index[i]].count_inactive += 1
+                            else:
+                                tracker.track_to_inactive(tracker.tracks[tracked_index[i]], tracker.frame_index)
                     # 对于新生检测的判断
                     index_new = index[index < self.num_queries]
-                    # 又重新使用了基于IOU的匹配方法，违背端到端的初衷
-                    # if tracker.track_num > 0 and len(un_track_box_results) > 0: 
-                    #     new_track_box = mask_box_result_return[index_new]                   
-                    #     angle_convert = torch.tensor([1.0, 1.0, 1.0, 1.0, math.pi / 2.0], device= new_track_box.device)
-                    #     iou = box_iou_rotated(new_track_box.float() * angle_convert, un_track_box_results.float() * angle_convert)
-                    #     max_value, max_index = torch.max(iou, dim=1)
-                    #     for i in range(len(iou)):
-                    #         if max_value[i] > 0.6:
-                    #             tracker.tracks[un_track_index[max_index[i]]].update(query[index_new[i]], mask_box_result_return[index_new[i], :], mask_cls_result[index_new].sigmoid())
-                    #             all_id[index_new[i]] = tracker.tracks[un_track_index[max_index[i]]].id
-                    #         else:                
-                    #             tracker.add_track(mask_box_result_return[index_new[i]], mask_cls_result[index_new[i]].sigmoid(), query[index_new[i]])
-                    #             all_id[index_new[i]] = tracker.tracks[-1].id
-                    # else:                
                     new_id = torch.arange(len(index_new)) + tracker.track_index
                     all_id[index_new] = new_id
                     if len(index_new) > 0:
                         tracker.add_tracks(mask_box_result_return[index_new], mask_cls_result[index_new].sigmoid(), query[index_new])
-                    instance_r.track_id = all_id[index]
+                    instance_r.track_id = all_id[index.to(all_id.device)]
                     # tracker.track_pos = torch.cat([mask_box_result[self.num_queries:], mask_box_result[index_new]], dim=0).unsqueeze(0)
                     # tracker.track_query = torch.cat([query[self.num_queries:], query[index_new]], dim=0).unsqueeze(0) 
                     tracker.step()   
                     processed_results[-1]["instances"] = instance_r
-                    # processed_results[-1]["item_instances"] = instance_i
-                    # processed_results[-1]["item_box"] = item_box_result
                     i += 1
             return processed_results
+        
+
+    def get_valid_id(self,scores,pred_masks,index):
+        scores = scores
+        masks = pred_masks
+        track_ids = index + 1
+        #根据scores对mask进行排序，对于重叠的mask，认为score的高的遮挡score低的mask
+        _, index  = torch.sort(scores)
+
+        seg = torch.zeros(pred_masks.shape[1:3],device=pred_masks.device,dtype=index.dtype)
+    
+        for i in index:
+            if scores[i] > 0.01:
+                mask = masks[i]
+                seg[mask > 0] = track_ids[i]
+        valid_index = []
+        for i in track_ids:
+            if torch.any(seg == i).item():
+                valid_index.append(i-1)
+        valid_index = torch.tensor(valid_index, device=index.device, dtype=index.dtype)
+        return valid_index
+
+    def get_valid_id_crop(self, scores, pred_masks, mask_size, mask_center, index):
+        scores = scores
+        masks = pred_masks
+        track_ids = index
+        #根据scores对mask进行排序，对于重叠的mask，认为score的高的遮挡score低的mask
+        _, index  = torch.sort(scores)
+
+        seg = torch.zeros(mask_size,device=pred_masks.device,dtype=index.dtype)
+    
+        for i in index:
+            if scores[i] > 0.01:
+                mask = masks[i]
+                center = mask_center[i]
+                start_x = int(center[0] - mask.shape[-1] / 2)
+                start_y = int(center[1] - mask.shape[-2] / 2)
+                end_x = int(start_x + mask.shape[-1])
+                end_y = int(start_y + mask.shape[-2])
+                # 确保区域不会超出大tensor的边界
+                if start_x < 0:
+                    start_x = 0
+                    crop_x = mask.shape[-1] - end_x
+                    mask = mask[:, crop_x:]
+                if start_y < 0:
+                    start_y = 0
+                    crop_y = mask.shape[-2] - end_y
+                    mask = mask[crop_y:, :]
+                if end_x >  mask_size[1]:
+                    end_x = mask_size[1]
+                    crop_x = end_x - start_x
+                    mask = mask[:, :crop_x]
+                if end_y > mask_size[0]:
+                    end_y = mask_size[0]
+                    crop_y = end_y - start_y
+                    mask = mask[:crop_y, :]
+                seg[start_y:end_y, start_x:end_x][mask > 0] = track_ids[i]
+        valid_index = []
+        for i in track_ids:
+            if torch.any(seg == i).item():
+                valid_index.append(i)
+        valid_index = torch.tensor(valid_index, device=index.device, dtype=index.dtype)
+        return valid_index
 
     def prepare_targets(self, targets, images):
         h_pad, w_pad = images.tensor.shape[-2:]
@@ -572,6 +746,64 @@ class CgtDINO(nn.Module):
                         "track_id": track_id,
                         "moist": moist,
                         "num_query": self.num_queries
+                    }
+                )
+                #print(targets_per_image.gt_boxes.tensor.shape[0])
+        return new_targets
+
+    def prepare_targets_simi(self, targets, images, moists, tracker, norm_images):
+        h_pad, w_pad = images.tensor.shape[-2:]
+        new_targets = []
+        max_num = 0
+        if tracker.track_ids is None:
+            for targets_per_image, moist, norm_image in zip(targets, moists, norm_images):
+            # pad gt
+                h, w = targets_per_image.image_size
+                gt_masks = targets_per_image.gt_masks
+                gt_ids = targets_per_image.gt_ids
+                if len(gt_ids) > max_num:
+                    max_num = len(gt_ids)
+                padded_masks = torch.zeros((gt_masks.shape[0], h_pad, w_pad), dtype=gt_masks.dtype, device=gt_masks.device)
+                padded_masks[:, : gt_masks.shape[1], : gt_masks.shape[2]] = gt_masks
+                targets_per_image.gt_boxes.scale(1 / float(w), 1 / float(h))
+                new_targets.append(
+                    {
+                        "labels": targets_per_image.gt_classes,
+                        "masks": padded_masks,
+                        "boxes": targets_per_image.gt_boxes.tensor,
+                        "gt_id":targets_per_image.gt_ids,
+                        "track_id": [],
+                        "moist": moist,
+                        "num_query": self.num_queries,
+                        "norm_image": norm_image
+                    }
+                )
+            tracker.max_num = max_num
+        else:
+            for targets_per_image, track_id, moist, interior_img, exterior_img, interior_fea, exterior_fea, last_box, norm_image, pixel in zip(targets, tracker.track_ids, tracker.moists, tracker.interior_img, tracker.exterior_img, tracker.interior_fea, tracker.exterior_fea, tracker.last_boxes, norm_images, tracker.pixel_num):
+                # pad gt
+                h, w = targets_per_image.image_size
+                gt_masks = targets_per_image.gt_masks
+                gt_ids = targets_per_image.gt_ids
+                padded_masks = torch.zeros((gt_masks.shape[0], h_pad, w_pad), dtype=gt_masks.dtype, device=gt_masks.device)
+                padded_masks[:, : gt_masks.shape[1], : gt_masks.shape[2]] = gt_masks
+                targets_per_image.gt_boxes.scale(1 / float(w), 1 / float(h))
+                new_targets.append(
+                    {
+                        "labels": targets_per_image.gt_classes,
+                        "masks": padded_masks,
+                        "boxes": targets_per_image.gt_boxes.tensor,
+                        "gt_id":targets_per_image.gt_ids,
+                        "track_id": track_id,
+                        "moist": moist,
+                        "num_query": self.num_queries,
+                        "interior_img": interior_img,
+                        "exterior_img": exterior_img,
+                        "interior_fea": interior_fea,
+                        "exterior_fea": exterior_fea,
+                        "last_boxes": last_box,
+                        "norm_image": norm_image,
+                        "pixel_num": pixel,
                     }
                 )
         return new_targets
@@ -715,29 +947,47 @@ class CgtDINO(nn.Module):
         result.pred_classes = labels_per_image
         return result
 
-    def instance_inference_nms(self, mask_cls, mask_pred, mask_box_result):
+    def instance_inference_nms(self, mask_cls, mask_pred, mask_box_result, score_thresd, nms_thresd, image_size, crop=False, mask_center=None):
         # mask_pred is already processed to have the same shape as original input
-        image_size = mask_pred.shape[-2:]
+        #image_size = mask_pred.shape[-2:]
         scores = mask_cls.sigmoid()  # [100, 80]
         #scores_per_image, topk_indices = scores.flatten(0, 1).topk(self.test_topk_per_image, sorted=False)  # select 100
         #将box scors与mask scores相乘
         pred_masks = (mask_pred > 0).float()
         mask_scores = (mask_pred.sigmoid().flatten(1) * pred_masks.flatten(1)).sum(1) / (pred_masks.flatten(1).sum(1) + 1e-6)
-        #track_mask_scores = mask_scores[self.num_queries:]
-        track_box_result = mask_box_result[self.num_queries:]
+        #track_box_result = mask_box_result[self.num_queries:]
         scores[:, 0] = mask_scores * scores[:, 0]
-        mask_box_result = BitMasks_ct(pred_masks).get_oriented_bounding_boxes(norm = False).to(pred_masks.device)  
-        track_box_result = mask_box_result[self.num_queries:]
+        #print(scores[self.num_queries:, 0])
+        if crop:
+            mask_box_result = BitMasks_ct(pred_masks).get_oriented_bounding_boxes_crop(mask_center, norm = False).to(pred_masks.device)
+        else:
+            mask_box_result = BitMasks_ct(pred_masks).get_oriented_bounding_boxes(norm = False).to(pred_masks.device)  
+        #track_box_result = mask_box_result[self.num_queries:]
         angle_scale = torch.tensor([1,1,1,1,90], device=mask_box_result.device)
         mask_box_result_return = mask_box_result / angle_scale
-        mask_box_result_return = box_ops.scale_obbox(mask_box_result_return, torch.tensor([1/image_size[0], 1/image_size[1]], dtype=float, device=mask_box_result_return.device), norm_angle= True)
-        mask_box_result_per_image, scores_per_image, labels_per_image, index = box_ops.multiclass_nms_rotated(mask_box_result.squeeze(0), scores.squeeze(0), 0.2, 0.4, return_inds=True) 
-        # 过滤掉有小面积较小的检测：
+        mask_box_result_return = box_ops.scale_obbox(mask_box_result_return, torch.tensor([1/image_size[1], 1/image_size[0]], dtype=float, device=mask_box_result_return.device), norm_angle= True)
+        if len(scores) == self.num_queries: #第一帧检测，加大阈值过滤掉由于旋转框IOU计算错误导致的检测
+            nms_thresd = 0.3
+            score_thresd = score_thresd - 0.1
+        mask_box_result_per_image, scores_per_image, labels_per_image, index = box_ops.multiclass_nms_rotated(mask_box_result.squeeze(0), scores.squeeze(0), score_thresd, nms_thresd, return_inds=True) 
+        # 过滤掉有小面积较小的检测和利用中心点距离来处理IOU没有过滤掉的错误检测：
         valid_index = []
+        index_track = index[index >= self.num_queries] 
+        if len(index_track) > 0:
+            index_new = index[index < self.num_queries]
+            det_distance = torch.cdist(mask_box_result_return[index_new, :2], mask_box_result_return[index_track, :2])
+            min_values, _ = torch.min(det_distance, dim=1)
+            index_new = index_new[min_values > 0.01]
+            index = torch.cat((index_track, index_new), dim=0)
         for i in index:
-            if mask_box_result_return[i][2] * mask_box_result_return[i][3] > 0.001:
+            if mask_box_result_return[i][2] * mask_box_result_return[i][3] > 0.00001:
                 valid_index.append(i)
         index = torch.tensor(valid_index, device=index.device)
+        #根据mask中的相互遮挡判断
+        if self.crop:
+            index = self.get_valid_id_crop(scores[:,0][index], pred_masks[index], image_size, mask_center[index], index)
+        else:
+            index = self.get_valid_id(scores[:,0][index], pred_masks[index], index)
         mask_box_result = mask_box_result[index]
         scores_per_image = scores[:, 0][index]
         labels_per_image = torch.zeros_like(index, device=labels_per_image.device)
@@ -750,7 +1000,6 @@ class CgtDINO(nn.Module):
         result.pred_boxes = RotatedBoxes(mask_box_result)
         # Uncomment the following to get boxes from masks (this is slow)
         # result.pred_boxes = BitMasks(mask_pred > 0).get_bounding_boxes()
-
         # calculate average mask prob
         # mask_scores_per_image = (mask_pred.sigmoid().flatten(1) * result.pred_masks.flatten(1)).sum(1) / (result.pred_masks.flatten(1).sum(1) + 1e-6)
         # if self.focus_on_box:
@@ -821,9 +1070,9 @@ class Tracker:
     def __init__(self, detection_obj_score_thresh = 0.3, 
         track_obj_score_thresh = 0.2,
         detection_nms_thresh = 0.4,
-        track_nms_thresh = 0.3,
+        track_nms_thresh = 0.15,
         public_detections = None,
-        inactive_patience = 5,
+        inactive_patience = 3,
         logger = None,
         detection_query_num = None,
         dn_query_num = None,

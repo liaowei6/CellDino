@@ -6,13 +6,16 @@ import torch
 class Tracker:
     def __init__(self, detection_obj_score_thresh = 0.3, 
         track_obj_score_thresh = 0.2,
-        detection_nms_thresh = 0.4,
-        track_nms_thresh = 0.3,
+        detection_nms_thresh = 0.5,
+        track_nms_thresh = 0.15,
         public_detections = None,
         inactive_patience = 5,
         logger = None,
         detection_query_num = None,
         dn_query_num = None,
+        track_min_area = 0.0018,
+        track_min_distance = 0.11,
+        special_frame = [],
         ):
         
         self.detection_obj_score_thresh = detection_obj_score_thresh
@@ -33,6 +36,11 @@ class Tracker:
         self.track_pos = None
         self.track_query = None
         self.moists = None
+        self.dataset=None
+        self.dataset_index=None
+        self.track_min_area = track_min_area
+        self.track_min_distance = track_min_distance
+        self.special_frame = [] #仅用于处理测试中部分帧的特殊情况
         #self.reid_sim_threshold = tracker_cfg['reid_sim_threshold']
         #self.reid_sim_only = tracker_cfg['reid_sim_only']
         #self.generate_attention_maps = generate_attention_maps
@@ -137,6 +145,7 @@ class Track(object):
         self.state = 3   #0代表inactive, 1代表track, 2表示lost 
         self.start_frame = start_frame
         self.end_frame = None
+
 
     def update(self, query_emb, pos, score):
         self.query_emb = query_emb

@@ -46,6 +46,11 @@ def add_maskdino_config(cfg):
     cfg.MODEL.MaskDINO.MOTION_WEIGHT = 1.
     cfg.MODEL.MaskDINO.MOTION_CLS_WEIGHT = 1.
     cfg.MODEL.MaskDINO.DUPLICATE_BOX_MATCHING = False
+    cfg.MODEL.MaskDINO.IMG_LST_WEIGHT = 1.
+    cfg.MODEL.MaskDINO.FEA_LST_WEIGHT = 1.
+    cfg.MODEL.MaskDINO.LCM_WEIGHT = 1.
+    cfg.MODEL.MaskDINO.DEEP_LST_WEIGHT = 1.
+    cfg.MODEL.MaskDINO.AREA_WEIGHT = 1.
     # cost weight
     cfg.MODEL.MaskDINO.COST_CLASS_WEIGHT = 4.0
     cfg.MODEL.MaskDINO.COST_DICE_WEIGHT = 5.0
@@ -88,6 +93,7 @@ def add_maskdino_config(cfg):
     cfg.MODEL.SEM_SEG_HEAD.FEATURE_ORDER = 'high2low'  # ['low2high', 'high2low'] high2low: from high level to low level
 
     cfg.MODEL.SEM_SEG_HEAD.NMS_QUERY_SELECT = False
+    cfg.MODEL.SEM_SEG_HEAD.QUERY_SELECT = False
     cfg.MODEL.SEM_SEG_HEAD.FEATURE_AUG = False
     cfg.MODEL.SEM_SEG_HEAD.NECK = False
     #####################
@@ -167,3 +173,5 @@ def add_maskdino_config(cfg):
 
     cfg.CROP = False
     cfg.TRACK = False
+    cfg.SIMI = False
+    cfg.DQ = False
