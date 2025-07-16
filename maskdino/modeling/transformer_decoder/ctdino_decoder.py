@@ -76,7 +76,6 @@ class CtDINODecoder(nn.Module):
             dec_layer_share: bool = False,
             semantic_ce_loss: bool = False,
             with_position: bool = False,
-            nms_query_select: bool = False,
             dn_aug: bool = False,
             temperature: int = 100000,
             crop: False,
@@ -156,7 +155,7 @@ class CtDINODecoder(nn.Module):
                 self.class_embed = nn.Linear(hidden_dim, num_classes)
         self.label_enc=nn.Embedding(num_classes,hidden_dim)
         self.mask_embed = MLP(hidden_dim, hidden_dim, mask_dim, 3)
-
+        self.mask_embed_item = MLP(hidden_dim, hidden_dim, mask_dim, 3)
         # init decoder
         self.decoder_norm = decoder_norm = nn.LayerNorm(hidden_dim)
         decoder_layer = DeformableTransformerDecoderLayer(hidden_dim, dim_feedforward,
@@ -179,7 +178,6 @@ class CtDINODecoder(nn.Module):
         self.obbox_embed = nn.ModuleList(box_embed_layerlist)
         self.decoder.obbox_embed = self.obbox_embed
         self.with_position = with_position
-        self.nms_query_select = nms_query_select
         self.temperature = temperature
         self.crop = crop
         self.new_pos = new_pos
@@ -209,7 +207,6 @@ class CtDINODecoder(nn.Module):
         ret["total_num_feature_levels"] = cfg.MODEL.SEM_SEG_HEAD.TOTAL_NUM_FEATURE_LEVELS
         ret["semantic_ce_loss"] = cfg.MODEL.MaskDINO.TEST.SEMANTIC_ON and cfg.MODEL.MaskDINO.SEMANTIC_CE_LOSS and ~cfg.MODEL.MaskDINO.TEST.PANOPTIC_ON
         ret["with_position"] = cfg.MODEL.SEM_SEG_HEAD.WITH_POSITION
-        ret["nms_query_select"] = cfg.MODEL.SEM_SEG_HEAD.NMS_QUERY_SELECT
         ret["dn_aug"]  = cfg.MODEL.MaskDINO.DN_AUG
         ret["temperature"] = cfg.MODEL.TEMPERATURE
         ret["crop"] = cfg.CROP
@@ -354,7 +351,6 @@ class CtDINODecoder(nn.Module):
             :param refpoint_emb: positional anchor queries in the matching part
             :param batch_size: bs
             """
-        # 加入重复框
         if self.training:
             scalar, noise_scale = self.dn_num,self.noise_scale
             fault_obbox_num = 30
@@ -413,7 +409,6 @@ class CtDINODecoder(nn.Module):
                 known_obbox_expand[:, 0:4] = known_obbox_expand[:, 0:4].clamp(min=0.0, max=1.0)
                 known_obbox_expand[:, 4] = known_obbox_expand[:, 4].clamp(min=0.0, max=90.0) / 90.0
 
-            #获取包含多个细胞的错误框
             arr = np.zeros((fault_obbox_num * batch_size, 2), dtype=np.int32)
             for i in range(fault_obbox_num):
                 arr[i, 0] = np.random.randint(0, single_pad / 2)
@@ -472,7 +467,6 @@ class CtDINODecoder(nn.Module):
                 else:
                     attn_mask[single_pad * i:single_pad * (i + 1), single_pad * (i + 1):pad_size] = True
                     attn_mask[single_pad * i:single_pad * (i + 1), :single_pad * i] = True
-            # 错误的框看不见重建的框
             attn_mask[pad_size:pad_size+fault_obbox_num,:pad_size] = True
 
             mask_dict = {
@@ -747,47 +741,23 @@ class CtDINODecoder(nn.Module):
             output_memory, output_proposals, vaild_mask = gen_encoder_output_proposals_ct(src_flatten, mask_flatten, spatial_shapes)  #(x, y, w, h, theta)
             output_memory = self.enc_output_norm(self.enc_output(output_memory))
             enc_outputs_class_unselected = self.class_embed(output_memory).sigmoid()
-            
-            #将mask的特征点处的分类概率设为-10
+        
             #enc_outputs_class_unselected[torch.where(~vaild_mask == True)] = -10
             enc_outputs_coord_unselected = self._obbox_embed(
                 output_memory) + output_proposals  # (bs, \sum{hw}, 5) unsigmoid
             topk = self.topk
             
-            #topk_proposals = torch.topk(enc_outputs_class_unselected.max(-1)[0], topk, dim=1)[1] #找出概率最大的topk个值，其中概率包括cell和duplicate_box
             
-            if self.nms_query_select and not self.training:
-                topk_proposals = torch.topk(enc_outputs_class_unselected[:, :, 0], 600, dim=1)[1] #选取400个topk个值
-            
-                scores = torch.gather(enc_outputs_class_unselected, 1,
-                                                   topk_proposals.unsqueeze(-1).repeat(1, 1, 2)) 
-                # class_unselected = torch.split(enc_outputs_class_unselected[:, :, 0], split_size_or_sections, dim=1)
-                # out = []
-                # for i, z in enumerate(class_unselected):
-                #     out.append(z.transpose(1, 2).view(bs, -1, size_list[i][0], size_list[i][1]))
-            else:
-                topk_proposals = torch.topk(enc_outputs_class_unselected[:, :, 0], topk, dim=1)[1] #只需要cell概率最大的topk个值
+            topk_proposals = torch.topk(enc_outputs_class_unselected[:, :, 0], topk, dim=1)[1] 
             refpoint_embed_undetach = torch.gather(enc_outputs_coord_unselected, 1,
                                                    topk_proposals.unsqueeze(-1).repeat(1, 1, 5))  # unsigmoid
-            #假设batch_size = 1, 加入NMS过滤
-            if self.nms_query_select and not self.training:
-                _, _, _, index = box_ops.multiclass_nms_rotated(refpoint_embed_undetach.squeeze(0).sigmoid(), scores.squeeze(0), -10, 0.5, topk, return_inds=True)
-                last_num = topk - index.shape[0]
-                if last_num > 0:
-                    query_num = torch.arange(topk, device=index.device)
-                    last_index = torch.tensor([x for x in query_num if x not in index], device=index.device)
-                    index = torch.cat((index, last_index[:last_num]))
-                refpoint_embed_undetach = refpoint_embed_undetach[0, index].unsqueeze(0)
-                topk_proposals = topk_proposals[0, index].unsqueeze(0)
                 
             refpoint_embed = refpoint_embed_undetach.detach()
 
             tgt_undetach = torch.gather(output_memory, 1,
                                   topk_proposals.unsqueeze(-1).repeat(1, 1, self.hidden_dim))  # unsigmoid
             if self.with_position:
-                outputs_class, outputs_mask = self.forward_prediction_heads_with_position(tgt_undetach.transpose(0, 1), mask_features, refpoint_embed_undetach.sigmoid().transpose(0, 1), valid_ratios)
-            # elif self.crop and not self.training: 
-            #     outputs_class, outputs_mask = self.forward_prediction_heads_with_crop(tgt_undetach.transpose(0, 1), mask_features, refpoint_embed_undetach.sigmoid().transpose(0, 1), valid_ratios)
+                outputs_class, outputs_mask = self.forward_prediction_heads_with_position(tgt_undetach.transpose(0, 1), mask_features, refpoint_embed_undetach.sigmoid().transpose(0, 1), valid_ratios, item=True)
             else:
                 outputs_class, outputs_mask = self.forward_prediction_heads(tgt_undetach.transpose(0, 1), mask_features)
             tgt = tgt_undetach.detach()
@@ -809,15 +779,15 @@ class CtDINODecoder(nn.Module):
                 flaten_mask = outputs_mask.detach().flatten(0, 1)
                 h, w = outputs_mask.shape[-2:]
                 if self.initialize_box_type == 'bitmask':  # slower, but more accurate
-                    refpoint_embed = BitMasks_ct(flaten_mask > 0).get_oriented_bounding_boxes().to(device)  #对斜边框角度进行归一化
+                    refpoint_embed = BitMasks_ct(flaten_mask > 0).get_oriented_bounding_boxes().to(device)  
                     refpoint_embed = box_ops.scale_obbox(refpoint_embed, torch.tensor([1/w, 1/h], dtype=float, device=refpoint_embed.device), norm_angle= True)
                 elif self.initialize_box_type == 'mask2box':  # faster conversion
                     refpoint_embed = box_ops.masks_to_boxes(flaten_mask > 0).to(device)
                 else:
                     assert NotImplementedError
-                #refpoint_embed = refpoint_embed / torch.as_tensor([w, h, w, h, 90], dtype=torch.float).to(device)  #对边框进行归一化
+                #refpoint_embed = refpoint_embed / torch.as_tensor([w, h, w, h, 90], dtype=torch.float).to(device)  
                 refpoint_embed = refpoint_embed.reshape(outputs_mask.shape[0], outputs_mask.shape[1], 5) #(bs, num_query, 5)
-                refpoint_embed = inverse_sigmoid(refpoint_embed) #后面要进行sigmoid
+                refpoint_embed = inverse_sigmoid(refpoint_embed) 
         elif not self.two_stage:
             tgt = self.query_feat.weight[None].repeat(bs, 1, 1)
             refpoint_embed = self.query_embed.weight[None].repeat(bs, 1, 1)
@@ -828,16 +798,10 @@ class CtDINODecoder(nn.Module):
             assert targets is not None
             if self.dn_aug:
                 input_query_label, input_query_obbox, tgt_mask, mask_dict = \
-                self.prepare_for_dn_with_aug(targets, None, None, x[0].shape[0])     #对角度进行归一化
+                self.prepare_for_dn_with_aug(targets, None, None, x[0].shape[0])     
             else:
                 input_query_label, input_query_obbox, tgt_mask, mask_dict = \
-                self.prepare_for_dn(targets, None, None, x[0].shape[0])     #对角度进行归一化
-            # 采用特征图中相应位置的特征作为query
-            # y = torch.split(output_memory, split_size_or_sections, dim=1)
-            # out = []
-            # for i, z in enumerate(y):
-            #     out.append(z.transpose(1, 2).view(bs, -1, size_list[i][0], size_list[i][1]))
-            # input_query_label, input_query_obbox, tgt_mask, mask_dict = self.prepare_for_dn_with_tgt(targets, out[-1].squeeze().permute(2,1,0), None, x[0].shape[0])
+                self.prepare_for_dn(targets, None, None, x[0].shape[0])    
             if mask_dict is not None:
                 tgt=torch.cat([input_query_label, tgt],dim=1)
 
@@ -917,7 +881,7 @@ class CtDINODecoder(nn.Module):
 
         return outputs_class, outputs_mask
 
-    def forward_prediction_heads_with_position(self, output, mask_features, reference_points, valid_ratios, pred_mask=True):
+    def forward_prediction_heads_with_position(self, output, mask_features, reference_points, valid_ratios, pred_mask=True, item=False):
         decoder_output = self.decoder_norm(output)
         decoder_output = decoder_output.transpose(0, 1)
         outputs_class = self.class_embed(decoder_output).float()
@@ -930,27 +894,11 @@ class CtDINODecoder(nn.Module):
                 query_pos = query_pos.transpose(0,1)
             else:
                 query_pos = self.decoder.ref_point_head(query_sine_embed).transpose(0,1)  # bs, nq, 256
-            mask_embed = self.mask_embed(decoder_output + query_pos)
+            if item:
+                mask_embed = self.mask_embed_item(decoder_output + query_pos)
+            else:
+                mask_embed = self.mask_embed(decoder_output + query_pos)
             outputs_mask = torch.einsum("bqc,bchw->bqhw", mask_embed, mask_features)
-            # 测试位置注意力机制，简单采用MLP映射并不能将位置编码映射为想要的样子
-            # pe_layer = PositionEmbeddingSine(128, temperature=self.temperature, normalize=True)
-            # test_pos = torch.tensor([[[0.5, 0.5, 0.1, 0.5, 0]]], device="cuda")
-            # test_pos_embed = gen_sineembed_for_position(test_pos, temperature=self.temperature)
-            # if self.new_pos:
-            #     test_pos_embed =  test_pos_embed[:,:,0:256] + self.decoder.ref_point_head(test_pos_embed[:,:,256:])
-            #     test_pos_embed = test_pos_embed.transpose(0,1)
-            # else:
-            #     test_pos_embed = self.decoder.ref_point_head(test_pos_embed).transpose(0,1)
-            # map = torch.ones([1, 1, 256, 256],device="cuda")
-            # map_pos = pe_layer(map) #bchw
-            # r = torch.einsum("bqc,bchw->bqhw",test_pos_embed, map_pos)
-            # r = r.squeeze()
-            # colors = [(1, 1, 1), (25/255,25/255,112/255)]  # 从白色到深蓝色
-            # cmap = LinearSegmentedColormap.from_list('custom_cmap', colors)
-            # #cmap = ListedColormap(colors)
-            # plt.imshow(r.cpu(), cmap=cmap, interpolation='nearest')
-            # plt.colorbar()  # 添加颜色条
-            # plt.show()
 
         return outputs_class, outputs_mask
 
@@ -965,25 +913,6 @@ class CtDINODecoder(nn.Module):
 
         return outputs_class, outputs_mask
 
-    # def multi_forward_prediction_heads(self, output, mask_features, pred_mask=True):
-    #     weights = self.weight_feature(output)
-    #     weights = self.softmax(weights).transpose(0, 1).unsqueeze(dim=2)
-    #     decoder_output = self.decoder_norm(output)
-    #     decoder_output = decoder_output.transpose(0, 1)
-    #     outputs_class = self.class_embed(decoder_output)
-    #     outputs_mask = None
-    #     if pred_mask:
-    #         mask_embed = self.mask_embed(decoder_output)
-    #         weight = weights[..., -1].unsqueeze(-1)
-    #         outputs_mask = torch.einsum("bqc,bchw->bqhw", mask_embed, mask_features) * weight
-    #         size = outputs_mask.shape[-2:]
-    #         for i, mask_feature in enumerate(mask_features[0:-1]):
-    #             weight =weights[..., i].unsqueeze(-1)
-    #             mask = torch.einsum("bqc,bchw->bqhw", mask_embed, mask_feature)
-    #             mask = F.interpolate(mask, size=size, mode="bilinear", align_corners=False)
-    #             outputs_mask = outputs_mask + weight * mask
-        
-    #     return outputs_class, outputs_mask
 
     @torch.jit.unused
     def _set_aux_loss(self, outputs_class, outputs_seg_masks, out_boxes=None):

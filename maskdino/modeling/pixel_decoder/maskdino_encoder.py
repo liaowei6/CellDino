@@ -463,8 +463,8 @@ class MaskDINOEncoder(nn.Module):
                     out.append(z.transpose(1, 2).view(bs, -1, spatial_shapes[i][0], spatial_shapes[i][1]))
             if self.with_position:
                 feature_pos_emb = self.pe_layer(x)
-                y = cur_fpn + feature_pos_emb + F.interpolate( out[self.high_resolution_index], size=cur_fpn.shape[-2:], mode="bilinear", align_corners=False)
-            else:    
+                y = cur_fpn + feature_pos_emb+  F.interpolate( out[self.high_resolution_index], size=cur_fpn.shape[-2:], mode="bilinear", align_corners=False)
+            else:
                 y = cur_fpn + F.interpolate( out[self.high_resolution_index], size=cur_fpn.shape[-2:], mode="bilinear", align_corners=False)
             y = output_conv(y)
             out.append(y)

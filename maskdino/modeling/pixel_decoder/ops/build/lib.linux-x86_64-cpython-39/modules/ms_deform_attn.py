@@ -32,7 +32,7 @@ def _is_power_of_2(n):
 
 
 class MSDeformAttn(nn.Module):
-    def __init__(self, d_model=256, n_levels=4, n_heads=8, n_points=4, motion_pred=False):
+    def __init__(self, d_model=256, n_levels=4, n_heads=8, n_points=4):
         """
         Multi-Scale Deformable Attention Module
         :param d_model      hidden dimension
@@ -57,9 +57,6 @@ class MSDeformAttn(nn.Module):
         self.n_points = n_points
 
         self.sampling_offsets = nn.Linear(d_model, n_heads * n_levels * n_points * 2)
-        self.motion_pred = motion_pred
-        if motion_pred:
-            self.sampling_offsets_second = nn.Linear(d_model, n_heads * n_levels * n_points * 2)
         self.attention_weights = nn.Linear(d_model, n_heads * n_levels * n_points)
         self.value_proj = nn.Linear(d_model, d_model)
         self.output_proj = nn.Linear(d_model, d_model)
@@ -87,7 +84,6 @@ class MSDeformAttn(nn.Module):
         :param query                       (N, Length_{query}, C)
         :param reference_points            (N, Length_{query}, n_levels, 2), range in [0, 1], top-left (0,0), bottom-right (1, 1), including padding area
                                         or (N, Length_{query}, n_levels, 4), add additional (w, h) to form reference boxes
-                                        or (N, Length_{query}, n_levels, 5), add additional (w, h,  theta) to from reference ebboxes
         :param input_flatten               (N, \sum_{l=0}^{L-1} H_l \cdot W_l, C)
         :param input_spatial_shapes        (n_levels, 2), [(H_0, W_0), (H_1, W_1), ..., (H_{L-1}, W_{L-1})]
         :param input_level_start_index     (n_levels, ), [0, H_0*W_0, H_0*W_0+H_1*W_1, H_0*W_0+H_1*W_1+H_2*W_2, ..., H_0*W_0+H_1*W_1+...+H_{L-1}*W_{L-1}]
@@ -95,7 +91,6 @@ class MSDeformAttn(nn.Module):
 
         :return output                     (N, Length_{query}, C)
         """
-
         N, Len_q, _ = query.shape
         N, Len_in, _ = input_flatten.shape
         assert (input_spatial_shapes[:, 0] * input_spatial_shapes[:, 1]).sum() == Len_in
@@ -105,8 +100,6 @@ class MSDeformAttn(nn.Module):
             value = value.masked_fill(input_padding_mask[..., None], float(0))
         value = value.view(N, Len_in, self.n_heads, self.d_model // self.n_heads)
         sampling_offsets = self.sampling_offsets(query).view(N, Len_q, self.n_heads, self.n_levels, self.n_points, 2)
-        if self.motion_pred:
-            sampling_offsets_second = self.sampling_offsets_second(query).view(N, Len_q, self.n_heads, self.n_levels, self.n_points, 2)
         attention_weights = self.attention_weights(query).view(N, Len_q, self.n_heads, self.n_levels * self.n_points)
         attention_weights = F.softmax(attention_weights, -1).view(N, Len_q, self.n_heads, self.n_levels, self.n_points)
         # N, Len_q, n_heads, n_levels, n_points, 2
@@ -115,40 +108,14 @@ class MSDeformAttn(nn.Module):
             sampling_locations = reference_points[:, :, None, :, None, :] \
                                  + sampling_offsets / offset_normalizer[None, None, None, :, None, :]
         elif reference_points.shape[-1] == 4:
-            # self.n_points 是进行归一化，因为生成时取值范围为[-n_points, n_points]
-            # 乘以宽和高的一半使得点位于proposal_bbox中
             sampling_locations = reference_points[:, :, None, :, None, :2] \
                                  + sampling_offsets / self.n_points * reference_points[:, :, None, :, None, 2:] * 0.5
-        elif reference_points.shape[-1] == 5:
-            #归一化后使采样点位于斜框之中
-            sampling_offsets = sampling_offsets / self.n_points * reference_points[:, :, None, :, None, 2:4] * 0.5
-            reference_points_angle = reference_points[:, :, None, :, None, 4]
-            sampling_offsets_xy = torch.zeros_like(sampling_offsets)
-            sampling_offsets_xy[:, :, :, :, :, 0] = sampling_offsets[:, :, :, :, :, 0] * torch.cos( - reference_points_angle * math.pi / 2) \
-                                                - sampling_offsets[:, :, :, :, :, 1] * torch.sin( - reference_points_angle * math.pi / 2)  
-            sampling_offsets_xy[:, :, :, :, :, 1] = sampling_offsets[:, :, :, :, :, 0] * torch.sin( - reference_points_angle * math.pi / 2) \
-                                                + sampling_offsets[:, :, :, :, :, 1] * torch.cos( - reference_points_angle * math.pi / 2) 
-            sampling_locations = reference_points[:, :, None, :, None, :2] + sampling_offsets_xy
-            if self.motion_pred:
-                sampling_offsets = sampling_offsets_second / self.n_points * reference_points[:, :, None, :, None, 2:4] * 0.5
-                reference_points_angle = reference_points[:, :, None, :, None, 4]
-                sampling_offsets_xy = torch.zeros_like(sampling_offsets)
-                sampling_offsets_xy[:, :, :, :, :, 0] = sampling_offsets[:, :, :, :, :, 0] * torch.cos( - reference_points_angle * math.pi / 2) \
-                                                - sampling_offsets[:, :, :, :, :, 1] * torch.sin( - reference_points_angle * math.pi / 2)  
-                sampling_offsets_xy[:, :, :, :, :, 1] = sampling_offsets[:, :, :, :, :, 0] * torch.sin( - reference_points_angle * math.pi / 2) \
-                                                + sampling_offsets[:, :, :, :, :, 1] * torch.cos( - reference_points_angle * math.pi / 2) 
-                sampling_locations_second = reference_points[:, :, None, :, None, :2] + sampling_offsets_xy
-
         else:
             raise ValueError(
                 'Last dim of reference_points must be 2 or 4, but get {} instead.'.format(reference_points.shape[-1]))
         try:
             output = MSDeformAttnFunction.apply(
                 value, input_spatial_shapes, input_level_start_index, sampling_locations, attention_weights, self.im2col_step)
-            if self.motion_pred:
-                output_second = MSDeformAttnFunction.apply(
-                    value, input_spatial_shapes, input_level_start_index, sampling_locations_second, attention_weights, self.im2col_step)
-                output = torch.cat([output, output_second], dim=1)
         except:
             # CPU
             output = ms_deform_attn_core_pytorch(value, input_spatial_shapes, sampling_locations, attention_weights)

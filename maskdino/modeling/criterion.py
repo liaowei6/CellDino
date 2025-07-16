@@ -17,16 +17,18 @@ from scipy.optimize import linear_sum_assignment
 from torch import nn
 import numpy as np
 import math
+from detectron2.structures import BitMasks
 from detectron2.utils.comm import get_world_size
 from detectron2.projects.point_rend.point_features import (
     get_uncertain_point_coords_with_randomness,
     point_sample,
 )
 from pycocotools import mask as coco_mask
-
+from ..utils import box_ops
 from ..utils.misc import is_dist_avail_and_initialized, nested_tensor_from_tensor_list
 from maskdino.utils import box_ops
 from mmcv.ops import box_iou_rotated
+from .loss_levelset import LevelsetLoss, LCM
 
 def convert_coco_poly_to_mask(segmentations, height, width):
     masks = []
@@ -50,6 +52,19 @@ def get_point_coords_with_gt_mask(gaussian_matrix, num_points):
     samples = gaussian.sample((num_points,)).transpose(0,1)
     samples = torch.clamp(samples, 0, 1)
     return samples
+
+def _scale_target(targets_, scaled_size=(96, 96)):
+    """ scale the targets to the scales size.
+
+    """
+
+    if targets_.dim() == 3:
+        targets = targets_.unsqueeze(1)
+    else:
+        targets = targets_
+    targets = F.interpolate(targets, size=scaled_size, mode='bilinear', align_corners=False)
+
+    return targets
 
 @torch.no_grad()
 def cost_matrix_compute(outputs, targets, cost=["cls", "obox"]):
@@ -238,7 +253,6 @@ def kfiou_loss(pred,
     Vb = 4 * Sigma.det().sqrt()
     Vb = torch.where(torch.isnan(Vb), torch.full_like(Vb, 0), Vb)
     KFIoU = Vb / (Vb_p + Vb_t - Vb + eps)
-
     if fun == 'ln':
         kf_loss = -torch.log(KFIoU + eps)
     elif fun == 'exp':
@@ -279,7 +293,7 @@ class SetCriterion(nn.Module):
     """
 
     def __init__(self, num_classes, matcher, weight_dict, eos_coef, losses,
-                 num_points, oversample_ratio, importance_sample_ratio,dn="no",dn_losses=[], panoptic_on=False, semantic_ce_loss=False, duplicate_box_matching=False, live_cell=False, num_gt_points = 0, dn_aug = False, crop = False):
+                 num_points, oversample_ratio, importance_sample_ratio,dn="no",dn_losses=[], panoptic_on=False, semantic_ce_loss=False, duplicate_box_matching=False, live_cell=False, num_gt_points = 0, dn_aug = False, crop = False, simi=False):
         """Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -313,6 +327,7 @@ class SetCriterion(nn.Module):
         self.duplicate_box_matching = duplicate_box_matching
         self.live_cell = live_cell
         self.crop = crop
+        self.simi = simi
 
     def loss_labels_ce(self, outputs, targets, indices, num_masks):
         """Classification loss (NLL)
@@ -340,7 +355,11 @@ class SetCriterion(nn.Module):
         src_logits = outputs['pred_logits']
 
         idx = self._get_src_permutation_idx(indices)
-        target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
+        try:
+            target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
+        except:
+            print(indices)
+            print(targets)
         target_classes = torch.full(src_logits.shape[:2], self.num_classes,
                                     dtype=torch.int64, device=src_logits.device)  #将第二类视为背景类
         target_classes[idx] = target_classes_o
@@ -354,6 +373,7 @@ class SetCriterion(nn.Module):
         losses = {'loss_ce': loss_ce}
 
         return losses
+
 
     def loss_labels_duplicate(self, outputs, targets, indices, indices_duplicate, num_boxes, item = False, log=True):
         """Classification loss (Binary focal loss)
@@ -380,36 +400,7 @@ class SetCriterion(nn.Module):
 
         return losses
 
-    def loss_motion_pred(self, outputs, targets, indices, num = None):
-        assert "pred_motion" in outputs
-        idx = self._get_src_permutation_idx(indices)
-        src_boxes = outputs['pred_motion'][idx]
-        target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
-        scale_angle = torch.tensor([1.0, 1.0, 1.0, 1.0, 90.0], device=target_boxes.device)
-        target_boxes = target_boxes / scale_angle
-        loss_giou = kfiou_loss(src_boxes, target_boxes)
-        losses = {}
-        losses['loss_motion'] = loss_giou.sum() / len(target_boxes)
-        return losses
 
-    def loss_motion_pred_cls(self, outputs, targets, indices, num=None):
-        assert 'pred_motion_cls' in outputs
-        src_logits = outputs['pred_motion_cls']
-
-        # idx = self._get_src_permutation_idx(indices)
-        # target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
-        # target_classes = torch.full(src_logits.shape[:2], 1,
-        #                             dtype=torch.int64, device=src_logits.device)  #将第二类视为背景类
-        # target_classes[idx] = target_classes_o
-
-        # target_classes_onehot = torch.zeros([src_logits.shape[0], src_logits.shape[1], src_logits.shape[2]+1],
-        #                                     dtype=src_logits.dtype, layout=src_logits.layout, device=src_logits.device)
-        # target_classes_onehot.scatter_(2, target_classes.unsqueeze(-1), 1)
-        # target_classes_onehot = target_classes_onehot[:,:,:-1]
-        loss_ce = sigmoid_focal_loss(src_logits.float(), targets.float(), len(outputs), alpha=0.75, gamma=2) * src_logits.shape[1]
-        losses = {'loss_motion_cls': loss_ce}
-
-        return losses
 
     def loss_boxes(self, outputs, targets, indices, num_boxes):
         """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
@@ -432,7 +423,7 @@ class SetCriterion(nn.Module):
 
         return losses
 
-    def loss_oboxes(self, outputs, targets, indices, num_boxes): #targets中的角度没有进行归一化
+    def loss_oboxes(self, outputs, targets, indices, num_boxes): 
         assert 'pred_boxes' in outputs
         idx = self._get_src_permutation_idx(indices)
         src_boxes = outputs['pred_boxes'][idx]
@@ -442,8 +433,7 @@ class SetCriterion(nn.Module):
         target_boxes = target_boxes / scale_angle
         target_boxes_detach = target_boxes.detach() * angle_convert
         src_boxes_detach = src_boxes.detach() * angle_convert
-        iou = 1 - box_iou_rotated(src_boxes_detach.float(), target_boxes_detach.float())
-        iou_weight = torch.diag(iou)
+        iou_weight = 1 - box_iou_rotated(src_boxes_detach.float(), target_boxes_detach.float(), aligned=True)
         loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction='none')
         loss_bbox = loss_bbox * iou_weight[:, None]
         losses = {}
@@ -453,7 +443,7 @@ class SetCriterion(nn.Module):
         losses['loss_giou'] = loss_giou.sum() / num_boxes
         return losses
 
-    def loss_oboxes_duplicate(self, outputs, targets, indices, indices_duplicate, num_boxes): #targets中的角度没有进行归一化
+    def loss_oboxes_duplicate(self, outputs, targets, indices, indices_duplicate, num_boxes): 
         assert 'pred_boxes' in outputs 
         idx = self._get_src_permutation_idx(indices)
         idx_duplicate = self._get_src_permutation_idx(indices_duplicate)
@@ -778,23 +768,23 @@ class SetCriterion(nn.Module):
             return loss_map[loss](outputs, targets, indices, indices_duplicate_labels, num_labels, item)
         return loss_map[loss](outputs, targets, indices, indices_duplicate, num_masks)
 
-    def get_loss(self, loss, outputs, targets, indices, num_masks):
+
+    def get_loss(self, loss, outputs, targets, indices, num_masks, second=False):
         loss_masks = self.loss_masks
+        loss_label = self.loss_labels
         if self.live_cell:
             loss_masks = self.loss_masks_polygons
         elif self.crop:
             loss_masks = self.loss_masks_crop
+        if self.semantic_ce_loss:
+            loss_label = self.loss_labels_ce
         loss_map = {
-            'labels': self.loss_labels_ce if self.semantic_ce_loss  else self.loss_labels,
+            'labels': loss_label,
             'masks': loss_masks, 
             'boxes': self.loss_boxes_panoptic if self.panoptic_on else self.loss_boxes,
             'oboxes': self.loss_oboxes,
-            'motion_pred': self.loss_motion_pred,
-            'motion_pred_cls': self.loss_motion_pred_cls,
         }
         assert loss in loss_map, f"do you really want to compute {loss} loss?"
-        # if loss == "labels" and self.duplicate_box_matching:
-        #     return self.loss_labels_item(outputs, targets, indices, num_masks)
         return loss_map[loss](outputs, targets, indices, num_masks)
 
     def forward(self, outputs, targets, mask_dict=None, is_track = False, tracker = None):
@@ -803,11 +793,13 @@ class SetCriterion(nn.Module):
              outputs: dict of tensors, see the output specification of the model for the format
              targets: list of dicts, such that len(targets) == batch_size.
                       The expected keys in each dict depends on the losses applied, see each loss' doc
+            is_track
+            tracker
         """
         outputs_without_aux = {k: v for k, v in outputs.items() if k != "aux_outputs" and k!= "pred_motion_cls" and k != "pred_motion"}
         losses = {}
         # Retrieve the matching between the outputs of the last layer and the targets
-        if self.dn is not "no" and mask_dict is not None:
+        if self.dn != "no" and mask_dict != None:
             output_known_lbs_bboxes,num_tgt,single_pad,scalar = self.prep_for_dn(mask_dict)
             exc_idx = []
             for i in range(len(targets)):
@@ -851,116 +843,72 @@ class SetCriterion(nn.Module):
             cost = [["cls", self.losses[2]]]
         else:
             cost = ["cls", self.losses[2], "mask"]
-        if is_track and len(targets[0]["track_id"]) > 0:
+        second = False
+        reverse = False
+        pseudo = False
+        if self.simi:
+            reverse = tracker.reverse
+            pseudo = tracker.pseudo
+        if is_track and tracker.track_num > 0:  
+            second = True
             num_obj_query = targets[0]["num_query"]
-            num_max_track_query = int((outputs_without_aux["pred_boxes"].shape[1] - num_obj_query) / 2)
+            num_max_track_query = (outputs_without_aux["pred_boxes"].shape[1] - num_obj_query)
             object_outputs = {}
             track_outputs = {}
             for i in outputs_without_aux:
-                if i != 'interm_outputs':
+                if i != 'interm_outputs' and i!="num_select" and i!= "counting_output" and i != "dq_outputs" and i!= 'track_outputs':
                     object_outputs[i] = outputs_without_aux[i][:, :num_obj_query]
                     track_outputs[i] = outputs_without_aux[i][:, num_obj_query:]
             object_targets = []
             track_output_indices = []
             target_output_indices = []
             object_target_indices = []
+            track_output_indices_only = []
             track_motion_output_indices = []
             motion_cls_targets = []
+            simi_track_indices = []
             for i in range(len(targets)):
                 object_target = {}
                 track_ids = targets[i]["track_id"]
                 target_ids = targets[i]["gt_id"]
-                num_track = len(track_ids)
                 num_target = len(target_ids)
-                track_moist = targets[i]["moist"]  #获取分裂事件
-                num_moist = len(track_moist)
                 motion_cls_target = torch.zeros_like(track_ids, device=track_ids.device)
-                #假设id数组都为numpy数组
-                # common_elements = np.intersect1d(track_ids, target_ids)
-                # indices_track = np.where(np.isin(track_ids, common_elements))
-                # indices_track = np.concatenate((indices_track, indices_track + num_max_track_query), axis=0)
-                # indices_target = np.where(np.isin(target_ids, common_elements))
-                # object_target_indice = np.setdiff1d(np.arange(0, num_track), indices_target)
-                # indices_target = np.concatenate((indices_target, indices_target), axis=0)
-                #假设都为tensor数组
-
-                #common_elements = torch.unique(torch.cat((track_ids, target_ids), dim=0))
-                #提取相邻两帧中相同对应id
                 combined = torch.cat((track_ids,target_ids), dim=0)
                 combined_val, counts = combined.unique(return_counts=True)
                 common_elements = combined_val[counts>1]
                 num_valid = len(common_elements)
-                indices_track = torch.tensor([torch.where(track_ids == x)[0][0] for x in common_elements], device=track_ids.device)
-                # equal_elements = torch.eq(track_ids.unsqueeze(1), common_elements.unsqueeze(0))
-                # indices_track = torch.nonzero(equal_elements)[:,0]
-                #indices_track = torch.where(torch.isin(track_ids, common_elements))
-                indices_track = torch.cat((indices_track, indices_track + num_max_track_query), dim=0)
-                indices_target = torch.tensor([torch.where(target_ids == x)[0][0] for x in common_elements], device=target_ids.device)
-                # equal_elements = torch.eq(target_ids.unsqueeze(1), common_elements.unsqueeze(0))
-                # indices_target = torch.nonzero(equal_elements)[:,0]
-                #indices_target = torch.where(torch.isin(target_ids, common_elements))
-                #object_target_indice = set(torch.arange(num_track)) - set(indices_target)
-                all_target_indices = torch.arange(num_target, device=indices_target.device)
+                indices_track = torch.tensor([torch.where(track_ids == x)[0][0] for x in common_elements], device=track_ids.device, dtype=torch.int64)
+                simi_track_indice = indices_track.clone()  
+                indices_target = torch.tensor([torch.where(target_ids == x)[0][0] for x in common_elements], device=target_ids.device, dtype=torch.int64)
+                all_target_indices = torch.arange(num_target, device=indices_target.device, dtype=torch.int64)
                 object_target_indice = torch.tensor([x not in indices_target for x in all_target_indices])
-                object_target_indice = all_target_indices[object_target_indice]
-                indices_target = torch.cat((indices_target, indices_target), dim=0)
-                #提取对应id的目标
-                # track_boxes_1 = track_output[i][indices_track]
-                # track_boxes_2 = track_output[i][indices_track + num_max_track_query]
-                # track_boxes = torch.cat((track_boxes_1, track_boxes_2), dim=0)  #包含两组
-                track_boxes = track_outputs["pred_boxes"][i][indices_track]
-                target_boxes = targets[i]["boxes"][indices_target]
-                scale_angle = torch.tensor([1.0, 1.0, 1.0, 1.0, 90.0], device=target_boxes.device)
-                target_boxes = target_boxes / scale_angle
-                similarity = 1 - kfiou_loss(track_boxes, target_boxes)
-                #track_output_indice = torch.zeros(valid_num, device=target_boxes.device)
-                all_ids = indices_track.clone()
-                value = similarity[:num_valid] - similarity[num_valid:]
-                all_ids[:num_valid] = all_ids[:num_valid] * (value > 0)
-                all_ids[num_valid:] = all_ids[num_valid:] * (value <= 0)
-                track_output_indice = all_ids[:num_valid] + all_ids[num_valid:]
+                object_target_indice = all_target_indices[object_target_indice==1]
+                track_output_indice = indices_track
                 target_output_indice = indices_target[:num_valid]
-
-                #处理分裂事件
-                moist_track_indice = torch.zeros(2, device=target_boxes.device, dtype=torch.int64)
-                moist_target_indice = torch.zeros(2, device=target_boxes.device, dtype=torch.int64)
-                for m in track_moist:
-                    moist_track_indice[0] = torch.where(track_ids == m)[0]
-                    moist_track_indice[1] = moist_track_indice[0] + num_max_track_query
-                    moist_track_boxes = track_outputs["pred_boxes"][i][moist_track_indice]
-                    moist_target_indice[0] = torch.where(target_ids == track_moist[m][0])[0]
-                    moist_target_indice[1] = torch.where(target_ids == track_moist[m][1])[0]
-                    #预测分裂概率
-                    motion_cls_target[moist_track_indice[0]] = 1
-                    #剩余新生目标
-                    remain_indice = torch.tensor([x not in moist_target_indice for x in object_target_indice])
-                    object_target_indice = object_target_indice[remain_indice]
-                    moist_target_boxes = targets[i]["boxes"][moist_target_indice]
-                    similarity_moist = box_iou_rotated(moist_track_boxes.float(), moist_target_boxes.float())
-                    moist_indices = linear_sum_assignment(similarity_moist.cpu())
-                    track_output_indice = torch.cat((track_output_indice, moist_track_indice[moist_indices[0]]), dim=0)
-                    target_output_indice = torch.cat((target_output_indice, moist_target_indice[moist_indices[1]]), dim=0)
                 for j in ["labels", "masks", "boxes"]:
                     object_target[j] = targets[i][j][object_target_indice]
                 object_targets.append(object_target)    
                 track_motion_output_indices.append((track_output_indice, target_output_indice))
                 track_output_indices.append(track_output_indice + num_obj_query)
-                target_output_indices.append(target_output_indice)
-                object_target_indices.append(object_target_indice)
+                track_output_indices_only.append(track_output_indice)
+                target_output_indices.append(target_output_indice.to(torch.int64))
+                object_target_indices.append(object_target_indice.to(torch.int64))
                 motion_cls_targets.append(motion_cls_target.unsqueeze(-1))
-            #track_motion_indices = (track_motion_output_indices, target_output_indices)
-            #losses.update(self.get_loss('motion_pred', outputs, targets, track_motion_output_indices, 0))
-            losses.update(self.get_loss('motion_pred_cls', outputs, torch.stack(motion_cls_targets, dim=0), track_motion_output_indices, 0))
+                simi_track_indices.append(simi_track_indice)
+            if not reverse and self.simi:
+                cost = ["mask_simi"]
             indices, cost_matrix = self.matcher(object_outputs, object_targets, cost = cost)
+            indices_track_only = []
             for index in range(len(indices)):
                 track_indices = torch.cat((indices[index][0].to(track_output_indices[index].device), track_output_indices[index]) , dim=0)
                 target_indices = torch.cat((object_target_indices[index][indices[index][1]].to(target_output_indices[index].device), target_output_indices[index]), dim=0)
-                indices[index] = (track_indices, target_indices)
+                indices[index] = (track_indices.to(torch.int64), target_indices.to(torch.int64))
+                indices_track_only.append((track_output_indices_only[index], target_output_indices[index]))
             del track_outputs
             del object_outputs
         else:
             indices, cost_matrix = self.matcher(outputs_without_aux, targets, cost=cost)         
-            if is_track:
+            if is_track:  
                 track_ids = []
                 track_moists = []
                 track_pos = []
@@ -985,10 +933,6 @@ class SetCriterion(nn.Module):
                 tracker.track_ids = track_ids
                 tracker.track_num = len(track_ids)
                 del track_query
-
-        #indices, cost_matrix = self.matcher(outputs_without_aux, targets, cost = ["cls", self.losses[2], "mask"]) 
-        # Compute the average number of target boxes accross all nodes, for normalization purposes
-        # um_masks = sum(len(t["labels"]) for t in targets)
         num_masks = min(sum(len(t["labels"]) for t in targets), outputs_without_aux["pred_boxes"].shape[1]*outputs_without_aux["pred_boxes"].shape[0])  #当query数量较少时
         num_masks = torch.as_tensor(
             [num_masks], dtype=torch.float, device=next(iter(outputs.values())).device
@@ -996,7 +940,6 @@ class SetCriterion(nn.Module):
         if is_dist_avail_and_initialized():
             torch.distributed.all_reduce(num_masks)
         num_masks = torch.clamp(num_masks / get_world_size(), min=1).item()
-        #获取已匹配之外的检测与GT之间的IOU
         if self.duplicate_box_matching:
             bs, num_queries = outputs_without_aux["pred_logits"].shape[:2]
             mask_indices = torch.ones((bs, num_queries), dtype=torch.bool)
@@ -1004,7 +947,6 @@ class SetCriterion(nn.Module):
             mask_indices.scatter_(1, indices_tmp, False)
             last_indices = [torch.nonzero(mask_indice).squeeze(dim=1) for mask_indice in mask_indices]
             last_iou =  torch.cat([giou[last_indice].unsqueeze(dim=0) for giou, last_indice in zip(cost_matrix, last_indices)], dim=0).to("cpu")
-            #每个GT最多匹配4个框
             mask_k_values, mask_k_indices = torch.topk(last_iou, 3, dim=1)
             last_zero_iou = torch.zeros_like(last_iou)
             last_iou_0 = last_zero_iou.scatter_(1, mask_k_indices, mask_k_values)
@@ -1017,16 +959,43 @@ class SetCriterion(nn.Module):
             num_masks_duplicate = num_masks + sum(indice_duplicate[1].shape[0] for indice_duplicate in indices_duplicate)
             num_labels = num_masks + sum(indice_duplicate[1].shape[0] for indice_duplicate in indices_duplicate_label)
         # Compute all the requested losses
-
+        if pseudo:
+            pseudo_targets = []
+            for i in range(len(targets)):
+                print(len(indices[0][1]))
+                pseudo_target = {}
+                src_idx = self._get_src_permutation_idx(indices)
+                src_masks = outputs["pred_masks"][src_idx]
+                src_masks = F.interpolate(
+                    src_masks.unsqueeze(0),
+                    size=(targets[0]["masks"].shape[-2], targets[0]["masks"].shape[-1]),
+                    mode="bilinear",
+                    align_corners=False,
+                    ).squeeze(0)
+                src_boxes = outputs['pred_boxes'][src_idx]
+                n = src_masks.shape[0]
+                scale_angle = torch.tensor([1.0, 1.0, 1.0, 1.0, 90.0], device=src_boxes.device)
+                src_boxes = src_boxes * scale_angle
+                src_labels = torch.zeros(n, dtype=torch.int64,device=src_masks.device)
+                tgt_index = indices[i][1]
+                src_ids = targets[i]["gt_id"][tgt_index]
+                src_masks[src_masks>0] = 1
+                src_masks[src_masks<0] = 0
+                pseudo_target["masks"] = src_masks.clone().detach()
+                pseudo_target["boxes"] = src_boxes.clone().detach()
+                pseudo_target["labels"] = src_labels.clone().detach()
+                pseudo_target["gt_ids"] = src_ids.clone().detach()
+                pseudo_targets.append(pseudo_target)
+            return {}, [pseudo_target]
 
         del outputs_without_aux
         for loss in self.losses:
             if self.duplicate_box_matching:
                 losses.update(self.get_loss_duplicate(loss, outputs, targets, indices, indices_duplicate, indices_duplicate_label, num_masks_duplicate, num_labels))
             else:
-                losses.update(self.get_loss(loss, outputs, targets, indices, num_masks))
-
-        if self.dn != "no" and mask_dict is not None:
+                losses.update(self.get_loss(loss, outputs, targets, indices, num_masks, second=second))
+    
+        if self.dn != "no" and mask_dict != None:
             l_dict={}
             for loss in self.dn_losses:
                 # num_targets = len(targets)
@@ -1051,14 +1020,21 @@ class SetCriterion(nn.Module):
                     object_outputs = {}
                     for j in aux_outputs:
                         object_outputs[j] = aux_outputs[j][:, :num_obj_query]
-                    indices, cost_matrix = self.matcher(object_outputs, object_targets, cost = cost)
-                    del object_outputs
-                    for index in range(len(indices)):
-                        track_indices = torch.cat((indices[index][0].to(track_output_indices[index].device), track_output_indices[index]) , dim=0)
-                        target_indices = torch.cat((object_target_indices[index][indices[index][1]].to(track_output_indices[index].device), target_output_indices[index]), dim=0)
-                        indices[index] = (track_indices, target_indices)
+                    if i==0:
+                        indices, cost_matrix = self.matcher(object_outputs, targets, cost = cost)
+                    else:
+                        indices, cost_matrix = self.matcher(object_outputs, object_targets, cost = cost)
+                        del object_outputs
+                        for index in range(len(indices)):
+                            track_indices = torch.cat((indices[index][0].to(track_output_indices[index].device), track_output_indices[index]) , dim=0)
+                            target_indices = torch.cat((object_target_indices[index][indices[index][1]].to(track_output_indices[index].device), target_output_indices[index]), dim=0)
+                            # if self.simi:
+                            #     indices[index] = (track_indices, target_indices, simi_track_indices[index], target_output_indices[index])  #加入前后两帧都有的
+                            # else:
+                            indices[index] = (track_indices, target_indices)                
                 else:
                     indices, cost_matrix = self.matcher(aux_outputs, targets, cost = cost)
+                
                 #indices, cost_matrix = self.matcher(aux_outputs, targets, cost = ["cls", self.losses[2], "mask"])
                 if self.duplicate_box_matching:
                     bs, num_queries = aux_outputs["pred_logits"].shape[:2]
@@ -1082,7 +1058,7 @@ class SetCriterion(nn.Module):
                     if self.duplicate_box_matching:
                         l_dict =self.get_loss_duplicate(loss, aux_outputs, targets, indices, indices_duplicate, indices_duplicate_label, num_masks_duplicate, num_labels)
                     else:
-                        l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_masks)
+                        l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_masks, second=second)
                     l_dict = {k + f"_{i}": v for k, v in l_dict.items()}
                     losses.update(l_dict)
                 if 'interm_outputs' in outputs:
@@ -1130,14 +1106,35 @@ class SetCriterion(nn.Module):
                 indices_duplicate = [(last_indices[i][mask_valid_indice], max_indices[i][mask_valid_indice]) for i,mask_valid_indice in enumerate(mask_valid_indices)]
                 num_masks_duplicate = num_masks + sum(indice_duplicate[1].shape[0] for indice_duplicate in indices_duplicate)
                 num_labels = num_masks + sum(indice_duplicate[1].shape[0] for indice_duplicate in indices_duplicate_label)
-            for loss in self.losses:
+            if self.simi and second and not reverse:
+                losses_dict = ["labels", "masks"]
+            else:
+                losses_dict = self.losses
+            for loss in losses_dict:
                 if self.duplicate_box_matching:
                     l_dict =self.get_loss_duplicate(loss, aux_outputs, targets, indices, indices_duplicate, indices_duplicate_label, num_masks_duplicate, num_labels, item=True)
                 else:
-                    l_dict = self.get_loss(loss, interm_outputs, targets, indices, num_masks)
+                    l_dict = self.get_loss(loss, interm_outputs, targets, indices, num_masks, second=second)
                 l_dict = {k + f'_interm': v for k, v in l_dict.items()}
                 losses.update(l_dict)
 
+        if 'track_outputs' in outputs:
+            track_outputs = outputs['track_outputs']
+            num_masks = min(len(indices_track_only[0][0]), len(indices_track_only[0][1]))
+            if num_masks>0:
+                for loss in losses_dict:
+                    l_dict = self.get_loss(loss, track_outputs, targets, indices_track_only, num_masks)
+                    l_dict = {k + f'_track': v for k, v in l_dict.items()}
+                    losses.update(l_dict)
+
+        if 'dq_outputs' in outputs and object_targets[0]["labels"].shape[0]>0:
+            dq_outputs = outputs['dq_outputs']
+            indices, cost_matrix = self.matcher(dq_outputs, object_targets, cost = cost)
+            dq_loss = self.get_loss('labels', dq_outputs, object_targets, indices, num_masks=indices[0][1].shape[0])
+            dq_loss = {k + f'_dq': v for k, v in dq_loss.items()}
+            losses.update(dq_loss)
+            if ~torch.isfinite(dq_loss['loss_ce_dq']).all():
+                print("张量中包含 NaN 或 Inf")
         return losses
 
     def __repr__(self):

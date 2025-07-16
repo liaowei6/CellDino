@@ -11,6 +11,7 @@ import math
 import cv2
 import numpy as np
 import copy
+import random
 from torch import nn, Tensor
 from ..pixel_decoder.ops.modules import MSDeformAttn
 from torch.nn import functional as F
@@ -27,10 +28,11 @@ from detectron2.structures import BitMasks
 from .ctdino_decoder import TRANSFORMER_DECODER_REGISTRY
 from typing import Optional, List, Union
 #from .dino_decoder import TransformerDecoder, DeformableTransformerDecoderLayer
-from ...utils.utils import MLP, gen_encoder_output_proposals_ct, inverse_sigmoid, BitMasks_ct, _get_clones, _get_activation_fn, gen_sineembed_for_position
+from ...utils.utils import MLP, gen_encoder_output_proposals_ct, inverse_sigmoid, BitMasks_ct, _get_clones, _get_activation_fn, gen_sineembed_for_position, get_rotated_rect_vertices, extract_region_features
 from ...utils import box_ops
 from ..pixel_decoder.position_encoding import PositionEmbeddingSine
-
+from .cmm import CategoricalCounting
+from .cgfe import CGFE, MultiScaleFeature
 # TRANSFORMER_DECODER_REGISTRY = Registry("TRANSFORMER_MODULE")
 # TRANSFORMER_DECODER_REGISTRY.__doc__ = """
 # Registry for transformer module in CgtDINO.
@@ -43,6 +45,26 @@ def build_transformer_decoder(cfg, in_channels, mask_classification=True):
     name = cfg.MODEL.MaskDINO.TRANSFORMER_DECODER_NAME
     return TRANSFORMER_DECODER_REGISTRY.get(name)(cfg, in_channels, mask_classification)
 
+
+
+def nms_distance(center_points, scores, distance_threshold):
+        # 计算中心点之间的距离矩阵
+        distances = torch.cdist(center_points, center_points)
+    
+        # 将对角线上的元素设为无穷大，以避免将中心点与自身进行比较
+        diagonal = torch.eye(center_points.size(0), device=distances.device).bool()
+        distances.masked_fill_(diagonal, float('inf'))
+    
+        # 找到保留的索引
+        keep = []
+        while torch.nonzero(scores).size(0) > 0:
+            max_idx = torch.argmax(scores)
+            keep.append(max_idx.item())
+            overlap = distances[max_idx] < distance_threshold
+            scores[overlap] = 0
+            scores[max_idx] = 0
+    
+        return keep
 
 @TRANSFORMER_DECODER_REGISTRY.register()
 class CgtDINODecoder(nn.Module):
@@ -82,6 +104,8 @@ class CgtDINODecoder(nn.Module):
             temperature: int = 100000,
             crop: False,
             new_pos: False,
+            simi: False,
+            dq: False,
     ):
         """
         NOTE: this interface is experimental.
@@ -157,8 +181,9 @@ class CgtDINODecoder(nn.Module):
                 self.class_embed = nn.Linear(hidden_dim, num_classes)
         self.label_enc=nn.Embedding(num_classes,hidden_dim)
         self.mask_embed = MLP(hidden_dim, hidden_dim, mask_dim, 3)
+        self.mask_embed_item = MLP(hidden_dim, hidden_dim, mask_dim, 3)
         #运动预测
-        self.motion_cls_pred = nn.Linear(hidden_dim, 1)
+        # self.motion_cls_pred = nn.Linear(hidden_dim, 1)
         # self.motion_pred = MLP(hidden_dim, hidden_dim, 5, 3)
         # self.motion_pred_first = nn.Linear(hidden_dim, 2)
         # self.motion_pred_second = nn.Linear(hidden_dim, 2)
@@ -180,7 +205,12 @@ class CgtDINODecoder(nn.Module):
         # self.track_pos_pred = DeformableTransformerDecoderLayer(hidden_dim, dim_feedforward,
         #                                                   dropout, activation,
         #                                                   self.num_feature_levels, nhead, dec_n_points, motion_pred=True)
-        self.track_query_process = copy.deepcopy(decoder_layer)
+        # self.detection_query_process = DeformableTransformerDecoderLayer(hidden_dim, dim_feedforward,
+        #                                                   dropout, activation,
+        #                                                   self.num_feature_levels, nhead, dec_n_points)
+        self.track_query_process = DeformableTransformerDecoderLayer(hidden_dim, dim_feedforward,
+                                                          dropout, activation,
+                                                          self.num_feature_levels, nhead, dec_n_points, track_trans=True)
 
         self.hidden_dim = hidden_dim
         self._obbox_embed = _obbox_embed = MLP(hidden_dim, hidden_dim, 5, 3)
@@ -194,7 +224,18 @@ class CgtDINODecoder(nn.Module):
         self.temperature = temperature
         self.crop = crop
         self.new_pos = new_pos
-
+        self.simi = simi
+        self.dq = dq
+        #判断是否为弱监督学习
+        # if self.simi:
+        #     self.levelset_bottom = nn.Conv2d(hidden_dim, 1, 3, padding=1)
+        #判断是否采用dunamic_query
+        if self.dq:
+            self.ccm = CategoricalCounting(cls_num=3)  #(100, 300, 500)
+            self.multiscale = MultiScaleFeature(is_5_scale=True)
+            self.CGFE = CGFE(gate_channels=256, reduction_ratio=16, num_feature_levels=self.num_feature_levels)
+            self.dynamic_query_list = [100, 300, 500]
+            self.object_select = Objectselectattention(d_model=hidden_dim)
     @classmethod
     def from_config(cls, cfg, in_channels, mask_classification):
         ret = {}
@@ -225,6 +266,8 @@ class CgtDINODecoder(nn.Module):
         ret["temperature"] = cfg.MODEL.TEMPERATURE
         ret["crop"] = cfg.CROP
         ret["new_pos"] = cfg.MODEL.SEM_SEG_HEAD.NEW_POS
+        ret["simi"] = cfg.SIMI
+        ret["dq"] = cfg.DQ
         return ret
 
     def prepare_for_dn(self, targets, tgt, refpoint_emb, batch_size):
@@ -283,8 +326,8 @@ class CgtDINODecoder(nn.Module):
                 diff = torch.zeros_like(known_obbox_expand)
                 diff_xy = known_obbox_expand[:, 2:4] / 2 
                 theta = known_obbox_expand[:, 4]
-                diff[:, 0] = diff_xy[:, 0] * torch.cos(- theta) + diff_xy[:, 1] * torch.sin(- theta)
-                diff[:, 1] = diff_xy[:, 1] * torch.cos(- theta) - diff_xy[:, 0] * torch.sin(- theta)
+                diff[:, 0] = diff_xy[:, 0] * torch.cos(- theta * math.pi / 180) + diff_xy[:, 1] * torch.sin(- theta * math.pi / 180)
+                diff[:, 1] = diff_xy[:, 1] * torch.cos(- theta * math.pi / 180) - diff_xy[:, 0] * torch.sin(- theta * math.pi / 180)
                 diff[:, 2:4] = known_obbox_expand[:, 2:4]
                 diff[:, 4] = torch.full_like(known_obbox_expand[:, 4], 45.0)
                 known_obbox_expand += torch.mul((torch.rand_like(known_obbox_expand) * 2 - 1.0),
@@ -415,8 +458,8 @@ class CgtDINODecoder(nn.Module):
                 diff = torch.zeros_like(known_obbox_expand)
                 diff_xy = known_obbox_expand[:, 2:4] / 2 
                 theta = known_obbox_expand[:, 4]
-                diff[:, 0] = diff_xy[:, 0] * torch.cos(- theta) + diff_xy[:, 1] * torch.sin(- theta)
-                diff[:, 1] = diff_xy[:, 1] * torch.cos(- theta) - diff_xy[:, 0] * torch.sin(- theta)
+                diff[:, 0] = diff_xy[:, 0] * torch.cos(- theta * math.pi / 180) + diff_xy[:, 1] * torch.sin(- theta * math.pi / 180)
+                diff[:, 1] = diff_xy[:, 1] * torch.cos(- theta * math.pi / 180) - diff_xy[:, 0] * torch.sin(- theta * math.pi / 180)
                 diff[:, 2:4] = known_obbox_expand[:, 2:4]
                 diff[:, 4] = torch.full_like(known_obbox_expand[:, 4], 45.0)
                 known_obbox_expand += torch.mul((torch.rand_like(known_obbox_expand) * 2 - 1.0),
@@ -755,11 +798,23 @@ class CgtDINODecoder(nn.Module):
         spatial_shapes = torch.as_tensor(spatial_shapes, dtype=torch.long, device=src_flatten.device)
         level_start_index = torch.cat((spatial_shapes.new_zeros((1,)), spatial_shapes.prod(1).cumsum(0)[:-1]))
         valid_ratios = torch.stack([self.get_valid_ratio(m) for m in masks], 1)
-
+        #dynamic query
+        if self.dq:
+            counting_output, ccm_feature = self.ccm(src_flatten, spatial_shapes)
+            multi_ccm_feature = self.multiscale(ccm_feature)
+            cgfe_out = self.CGFE(multi_ccm_feature, src_flatten, spatial_shapes)
+            memory = cgfe_out        
+            _, predicted = torch.max(counting_output.data, 1)
+            num_select = self.dynamic_query_list[max(predicted.tolist())]
+            #num_select = 250
+            tracker.pred_num = num_select
         predictions_class = []
         predictions_mask = []
         if self.two_stage:
-            output_memory, output_proposals, vaild_mask = gen_encoder_output_proposals_ct(src_flatten, mask_flatten, spatial_shapes)  #(x, y, w, h, theta)
+            if self.dq:
+                output_memory, output_proposals, vaild_mask = gen_encoder_output_proposals_ct(memory, mask_flatten, spatial_shapes)  #(x, y, w, h, theta)
+            else:
+                output_memory, output_proposals, vaild_mask = gen_encoder_output_proposals_ct(src_flatten, mask_flatten, spatial_shapes)  #(x, y, w, h, theta)
             output_memory = self.enc_output_norm(self.enc_output(output_memory))
             enc_outputs_class_unselected = self.class_embed(output_memory).sigmoid()
             #将mask的特征点处的分类概率设为-10
@@ -767,25 +822,25 @@ class CgtDINODecoder(nn.Module):
             enc_outputs_coord_unselected = self._obbox_embed(
                 output_memory) + output_proposals  # (bs, \sum{hw}, 5) unsigmoid
             topk = self.topk
-            
-            #topk_proposals = torch.topk(enc_outputs_class_unselected.max(-1)[0], topk, dim=1)[1] #找出概率最大的topk个值，其中概率包括cell和duplicate_box
-            
+            if self.dq:
+                if self.training:
+                    topk = targets[0]["num_query"]
+                    self.num_queries = topk
+                else:
+                    topk = num_select
+                    self.num_queries = topk
             if self.nms_query_select and not self.training:
-                topk_proposals = torch.topk(enc_outputs_class_unselected[:, :, 0], 600, dim=1)[1] #选取400个topk个值
+                topk_proposals = torch.topk(enc_outputs_class_unselected[:, :, 0], 300, dim=1)[1] #选取400个topk个值
             
                 scores = torch.gather(enc_outputs_class_unselected, 1,
                                                    topk_proposals.unsqueeze(-1).repeat(1, 1, 2)) 
-                # class_unselected = torch.split(enc_outputs_class_unselected[:, :, 0], split_size_or_sections, dim=1)
-                # out = []
-                # for i, z in enumerate(class_unselected):
-                #     out.append(z.transpose(1, 2).view(bs, -1, size_list[i][0], size_list[i][1]))
             else:
                 topk_proposals = torch.topk(enc_outputs_class_unselected[:, :, 0], topk, dim=1)[1] #只需要cell概率最大的topk个值
             refpoint_embed_undetach = torch.gather(enc_outputs_coord_unselected, 1,
                                                    topk_proposals.unsqueeze(-1).repeat(1, 1, 5))  # unsigmoid
-            #假设batch_size = 1, 加入NMS过滤 似乎是负作用，会过滤掉一些检测
+            #假设batch_size = 1, 加入NMS过滤 似乎是负作用，会过滤掉一些检测,可以降低NMS阈值
             if self.nms_query_select and not self.training:
-                _, _, _, index = box_ops.multiclass_nms_rotated(refpoint_embed_undetach.squeeze(0).sigmoid(), scores.squeeze(0), -10, 0.2, topk, return_inds=True)
+                _, _, _, index = box_ops.multiclass_nms_rotated(refpoint_embed_undetach.squeeze(0).sigmoid(), scores.squeeze(0), -10, 0.5, topk, return_inds=True)
                 last_num = topk - index.shape[0]
                 if last_num > 0:
                     query_num = torch.arange(topk, device=index.device)
@@ -799,15 +854,17 @@ class CgtDINODecoder(nn.Module):
             tgt_undetach = torch.gather(output_memory, 1,
                                   topk_proposals.unsqueeze(-1).repeat(1, 1, self.hidden_dim))  # unsigmoid
             if self.with_position:
-                outputs_class, outputs_mask = self.forward_prediction_heads_with_position(tgt_undetach.transpose(0, 1), mask_features, refpoint_embed_undetach.sigmoid().transpose(0, 1), valid_ratios)
-            # elif self.crop and not self.training: 
-            #     outputs_class, outputs_mask = self.forward_prediction_heads_with_crop(tgt_undetach.transpose(0, 1), mask_features, refpoint_embed_undetach.sigmoid().transpose(0, 1), valid_ratios)
+                if not self.crop:
+                    outputs_class, outputs_mask = self.forward_prediction_heads_with_position(tgt_undetach.transpose(0, 1), mask_features, refpoint_embed_undetach.sigmoid().transpose(0, 1), valid_ratios, item=True)
+                else: 
+                    outputs_class, outputs_mask = self.forward_prediction_heads_with_position_crop(tgt_undetach.transpose(0, 1), mask_features, refpoint_embed_undetach.sigmoid().transpose(0, 1), valid_ratios)
             else:
-                outputs_class, outputs_mask = self.forward_prediction_heads(tgt_undetach.transpose(0, 1), mask_features)
+                outputs_class, outputs_mask = self.forward_prediction_heads(tgt_undetach.transpose(0, 1), mask_features, item=True)
             tgt = tgt_undetach.detach()
             if self.learn_tgt:
                 tgt = self.query_feat.weight[None].repeat(bs, 1, 1)
             interm_outputs=dict()
+            interm_outputs['query'] = tgt
             interm_outputs['pred_logits'] = outputs_class
             interm_outputs['pred_boxes'] = refpoint_embed_undetach.sigmoid()
             interm_outputs['pred_masks'] = outputs_mask
@@ -818,15 +875,22 @@ class CgtDINODecoder(nn.Module):
                 flaten_mask = outputs_mask.detach().flatten(0, 1)
                 h, w = outputs_mask.shape[-2:]
                 if self.initialize_box_type == 'bitmask':  # slower, but more accurate
-                    refpoint_embed = BitMasks_ct(flaten_mask > 0).get_oriented_bounding_boxes().to(device)  #对斜边框角度进行归一化
-                    refpoint_embed = box_ops.scale_obbox(refpoint_embed, torch.tensor([1/w, 1/h], dtype=float, device=refpoint_embed.device), norm_angle= True)
+                    if not self.crop:
+                        refpoint_embed = BitMasks_ct(flaten_mask > 0).get_oriented_bounding_boxes().to(device)  #对斜边框角度进行归一化
+                        refpoint_embed = box_ops.scale_obbox(refpoint_embed, torch.tensor([1/w, 1/h], dtype=float, device=refpoint_embed.device), norm_angle= True)
+                    else:
+                        refpoint_embed_crop = BitMasks_ct(flaten_mask > 0).get_oriented_bounding_boxes().to(device)  #对斜边框角度进行归一化
+                        #refpoint_embed_crop = box_ops.scale_obbox(refpoint_embed_crop, torch.tensor([1/w, 1/h], dtype=float, device=device), norm_angle= True)
+                        H, W = mask_features.shape[-2:]
+                        refpoint_embed_crop[..., :2] = refpoint_embed_crop[..., :2] + refpoint_embed[..., :2].sigmoid() * torch.tensor([W, H], device=device) - torch.tensor([w/2, h/2], device=device)
+                        refpoint_embed = box_ops.scale_obbox(refpoint_embed_crop, torch.tensor([1/W, 1/H], dtype=float, device=refpoint_embed.device), norm_angle= True)
                 elif self.initialize_box_type == 'mask2box':  # faster conversion
                     refpoint_embed = box_ops.masks_to_boxes(flaten_mask > 0).to(device)
                 else:
                     assert NotImplementedError
                 #refpoint_embed = refpoint_embed / torch.as_tensor([w, h, w, h, 90], dtype=torch.float).to(device)  #对边框进行归一化
                 refpoint_embed = refpoint_embed.reshape(outputs_mask.shape[0], outputs_mask.shape[1], 5) #(bs, num_query, 5)
-                object_query_center_pos = refpoint_embed[:, :, :2].clone() #用于矫正轨迹位置
+                object_query_pos = refpoint_embed.clone() #用于矫正轨迹位置
                 refpoint_embed = inverse_sigmoid(refpoint_embed) #后面要进行sigmoid
         elif not self.two_stage:
             tgt = self.query_feat.weight[None].repeat(bs, 1, 1)
@@ -853,69 +917,44 @@ class CgtDINODecoder(nn.Module):
                 tgt=torch.cat([input_query_label, tgt],dim=1)
                 refpoint_embed=torch.cat([input_query_obbox,refpoint_embed],dim=1)
             dn_num = input_query_obbox.shape[1]
+
         # 在训练时将追踪轨迹加入整个query中,应对有丝分裂，将track query进行复制
-        track_motion_cls = None
-        track_pos_undetach = None
+        track_query=None
+        track_pos=None
         if  tracker.track_num > 0:
             if self.training:
                 N = refpoint_embed.shape[1]
+                n = tracker.max_num
+                if not self.simi or tracker.reverse:
+                    #随机抛弃一些query
+                    # 1. 随机生成丢弃比例（0% 到 10%）
+                    drop_ratio = random.uniform(0, 0.2)
+                    # 2. 计算需要保留的样本数量
+                    k = max(1, int(n * (1 - drop_ratio)))
+                    # 3. 随机选择保留的样本索引
+                    indices = torch.randperm(n)[:k]
+                    tracker.track_query = tracker.track_query[:, indices]
+                    tracker.track_pos = tracker.track_pos[:, indices]
+                    for i in range(len(tracker.track_ids)):
+                        tracker.track_ids[i] = tracker.track_ids[i][indices]
+                        targets[i]["track_id"] = targets[i]["track_id"][indices]
+                    tracker.max_num = k
                 track_query = tracker.track_query.transpose(0, 1)
                 track_pos = tracker.track_pos.transpose(0, 1)
-                track_motion_cls  = self.motion_cls_pred(track_query.transpose(0, 1))
-                # track_pos = inverse_sigmoid(track_pos)
-                # 运动预测
-                # object_query_score = interm_outputs['pred_logits'].sigmoid()
-                # object_query_score[:, :, 1] = object_query_score[:, :, 0]
-                # object_query_center_pos = object_query_center_pos[object_query_score > 0.3].view(object_query_score.shape[0], -1, 2)
-                # # object_query_center_pos[object_query_center_pos > 0.2] = 0
-                # # 扩展维度以便能够进行广播操作
-                # expanded_tensor1 = track_pos.unsqueeze(2)  # shape: [1, N, 1, 2]
-                # expanded_tensor2 = object_query_center_pos.unsqueeze(1)  # shape: [1, 1, M, 2]
-
-                # # 计算欧氏距离  
-                # diff = expanded_tensor2 - expanded_tensor1[:,:,:,:2]  # 计算差值
-                # distance = torch.sqrt(torch.sum(diff ** 2, dim=-1))  # 计算欧氏距离
-
-                # # 获取每个 tensor1 中值对应的最小距离索引（最小的两个）
-                # min_indices = torch.topk(distance, k=2, dim=2, largest=False)  # 获取最小距离索引
-                # min_diatance = min_indices[0]
-                # min_indices = min_indices[1]
-                # # 根据最小距离索引获取对应的 tensor2 中的值
-                # min_diff = torch.gather(diff, 2, min_indices.unsqueeze(-1).repeat(1, 1, 1, 2))
-                # min_diff[min_diatance > 0.15] = 0
-                # min_diff = torch.cat([min_diff[:, :, 0, :], min_diff[:, :, 1, :]], dim=1)
-                # track_pos = torch.cat((track_pos, track_pos), dim=1)
-                # track_pos[:, :, :2] = track_pos[:, :, :2] + min_diff
-                # track_pos = track_pos.transpose(0, 1)
-
-                # track_pos_pred = track_pos.clone()
-                # track_pos_pred[:, :,2:4] = track_pos[:, :, 2:4] * 1.2
-                # reference_points_input = box_ops.scale_obbox((track_pos_pred)[:, :, None], valid_ratios[None, :], norm_angle= True).to(torch.float32)  # nq, bs, nlevel, 5                                       
-                # query_sine_embed = gen_sineembed_for_position(reference_points_input[:, :, 0, :], self.temperature) # nq, bs, 128 * 5
-                # if self.new_pos:
-                #     query_pos = query_sine_embed[:,:,0:256] + self.decoder.ref_point_head(query_sine_embed[:,:,256:])
-                # else:
-                #     query_pos = self.decoder.ref_point_head(query_sine_embed)  # nq, bs, 256
-                # track_query_motion_pred = self.track_pos_pred(tgt=track_query,
-                #                                        tgt_query_pos=query_pos,
-                #                                        tgt_reference_points=reference_points_input,
-                #                                        memory=src_flatten.transpose(0, 1),
-                #                                        memory_key_padding_mask=mask_flatten,
-                #                                        memory_level_start_index=level_start_index,
-                #                                        memory_spatial_shapes=spatial_shapes,)
-                # track_motion_pred = self.motion_pred(track_query_motion_pred)
-                # track_motion_cls = self.motion_cls_pred(track_query_motion_pred).transpose(0, 1)
-                # track_pos_first = track_pos.clone()
-                # track_pos_second = track_pos.clone()
-                # track_pos_first[:, :, :2] = track_pos[:, :, :2] + delta_motion
-                # track_pos_second[:, :, :2] = track_pos[:, :, :2] - delta_motion
-                #将query和pos进行复制
-                track_query = torch.cat([track_query, track_query], dim=0)
-                track_pos = torch.cat([track_pos, track_pos], dim=0)
-                # track_pos_undetach = torch.cat([track_pos, track_pos], dim=0)
-                # track_pos_undetach = (inverse_sigmoid(track_pos_undetach) + track_motion_pred).sigmoid()
-                # track_pos = track_pos_undetach.detach()
-                # track_pos_undetach = track_pos_undetach.transpose(0, 1)             
+                #训练是在track_pos中加入一定的噪声
+                noise_scale=0.1
+                diff = torch.zeros_like(track_pos)
+                diff_xy = track_pos[:, :, 2:4] / 2 
+                theta = track_pos[:,:, 4] * math.pi / 2 
+                diff[:, :, 0] = diff_xy[:, :, 0] * torch.cos(- theta) + diff_xy[:, :, 1] * torch.sin(- theta)
+                diff[:, :, 1] = diff_xy[:, :, 1] * torch.cos(- theta) - diff_xy[:, :, 0] * torch.sin(- theta)
+                diff[:, :, 2:4] = track_pos[:, :, 2:4]
+                diff[:, :, 4] = torch.full_like(track_pos[:, :, 4], 0.5)
+                track_pos += torch.mul((torch.rand_like(track_pos) * 2 - 1.0),
+                                               diff).cuda() * noise_scale
+                track_pos[:, :, 0:5] = track_pos[:, :, 0:5].clamp(min=0.0, max=1.0)
+                #track_pos = torch.cat([track_pos, track_pos_noise], dim=0)  #进行复制           
+                #调整track_query
                 reference_points_input = box_ops.scale_obbox((track_pos)[:, :, None], valid_ratios[None, :], norm_angle= True).to(torch.float32)  # nq, bs, nlevel, 5                                       
                 query_sine_embed = gen_sineembed_for_position(reference_points_input[:, :, 0, :], self.temperature) # nq, bs, 128 * 5
                 if self.new_pos:
@@ -931,80 +970,159 @@ class CgtDINODecoder(nn.Module):
                                                        memory_spatial_shapes=spatial_shapes,)    
                 reference_before_sigmoid = inverse_sigmoid(track_pos)
                 delta_unsig = self._obbox_embed(track_query).to(device)
-
                 track_pos = delta_unsig + reference_before_sigmoid
                 track_pos = track_pos.transpose(0, 1)
                 track_query = track_query.transpose(0, 1)
 
-                tgt = torch.cat([tgt, track_query],dim=1)
-                #tgt = torch.cat([tgt, track_query],dim=1)
-                refpoint_embed = torch.cat([refpoint_embed, track_pos],dim=1)
-                #refpoint_embed = torch.cat([refpoint_embed, track_pos],dim=1)
-                M = refpoint_embed.shape[1]
-                padding_tgt_mask = torch.full((M, M), False, device=tgt_mask.device)
-                padding_tgt_mask[:N, :N] = tgt_mask
-                padding_tgt_mask[N:M, :dn_num] = True
-                tgt_mask = padding_tgt_mask
-                del padding_tgt_mask
-                del input_query_obbox
-                del input_query_label
-            else:
-                track_query = tracker.track_query.transpose(0, 1)
-                track_pos = tracker.track_pos
-                track_motion_cls  = self.motion_cls_pred(track_query.transpose(0, 1)).sigmoid()
-                print(tracker.track_ids)
-                print(track_motion_cls.squeeze())
-                # track_pos = inverse_sigmoid(track_pos)
-                # 运动预测
-                object_query_score = interm_outputs['pred_logits'].sigmoid()
-                object_query_score[:, :, 1] = object_query_score[:, :, 0]
-                object_query_center_pos = object_query_center_pos[object_query_score > 0.3].view(object_query_score.shape[0], -1, 2)
-                # object_query_center_pos[object_query_center_pos > 0.2] = 0
-                # 扩展维度以便能够进行广播操作
-                expanded_tensor1 = track_pos.unsqueeze(2)  # shape: [1, N, 1, 2]
-                expanded_tensor2 = object_query_center_pos.unsqueeze(1)  # shape: [1, 1, M, 2]
+                #对齐后的track query进行监督训练
+                # outputs_class_track, outputs_mask_track = self.forward_prediction_heads_with_position(track_query, mask_features, track_pos.sigmoid(), valid_ratios)
+                # track_outputs=dict()
+                # track_outputs['pred_logits'] = outputs_class_track
+                # track_outputs['pred_boxes'] = track_pos.transpose(0,1).sigmoid()
+                # track_outputs['pred_masks'] = outputs_mask_track
+                # track_pos = track_pos.transpose(0, 1).detach()
+                # track_query = track_query.transpose(0, 1).detach()
 
-                # 计算欧氏距离  
-                diff = expanded_tensor2 - expanded_tensor1[:,:,:,:2]  # 计算差值
-                distance = torch.sqrt(torch.sum(diff ** 2, dim=-1))  # 计算欧氏距离
-
-                # 获取每个 tensor1 中值对应的最小距离索引（最小的两个）
-                min_indices = torch.topk(distance, k=2, dim=2, largest=False)  # 获取最小距离索引
-                min_diatance = min_indices[0]
-                min_indices = min_indices[1]
-                # 根据最小距离索引获取对应的 tensor2 中的值
-                min_diff = torch.gather(diff, 2, min_indices.unsqueeze(-1).repeat(1, 1, 1, 2))
-                min_diff[min_diatance > 0] = 0
-                min_diff = torch.cat([min_diff[:, :, 0, :], min_diff[:, :, 1, :]], dim=1)
-                track_pos = torch.cat((track_pos, track_pos), dim=1)
-                track_pos[:, :, :2] = track_pos[:, :, :2] + min_diff
-                track_pos = track_pos.transpose(0, 1)
-
-                # track_pos_pred = track_pos.clone()
-                # track_pos_pred[:, :,2:4] = track_pos[:, :, 2:4] * 1.3
-                # reference_points_input = box_ops.scale_obbox((track_pos_pred)[:, :, None], valid_ratios[None, :], norm_angle= True).to(torch.float32)  # nq, bs, nlevel, 5                                       
+                #调整object_query
+                # tgt = tgt.transpose(0,1)
+                # refpoint_embed = refpoint_embed.transpose(0,1)
+                # reference_points_input = box_ops.scale_obbox((refpoint_embed.sigmoid())[:, :, None], valid_ratios[None, :], norm_angle= True).to(torch.float32)  # nq, bs, nlevel, 5                                       
                 # query_sine_embed = gen_sineembed_for_position(reference_points_input[:, :, 0, :], self.temperature) # nq, bs, 128 * 5
                 # if self.new_pos:
                 #     query_pos = query_sine_embed[:,:,0:256] + self.decoder.ref_point_head(query_sine_embed[:,:,256:])
                 # else:
                 #     query_pos = self.decoder.ref_point_head(query_sine_embed)  # nq, bs, 256
-                # track_query_motion_pred = self.track_pos_pred(tgt=track_query,
-                #                                        tgt_query_pos=query_pos,
-                #                                        tgt_reference_points=reference_points_input,
-                #                                        memory=src_flatten.transpose(0, 1),
-                #                                        memory_key_padding_mask=mask_flatten,
-                #                                        memory_level_start_index=level_start_index,
-                #                                        memory_spatial_shapes=spatial_shapes,)
-                # track_motion_pred = self.motion_pred(track_query_motion_pred)
-                
+                # tgt = self.detection_query_process( tgt=tgt,
+                #                                 tgt_query_pos=query_pos,
+                #                                 tgt_reference_points=reference_points_input,
+                #                                 memory=src_flatten.transpose(0, 1),
+                #                                 memory_key_padding_mask=mask_flatten,
+                #                                 memory_level_start_index=level_start_index,
+                #                                 memory_spatial_shapes=spatial_shapes,)    
+                # delta_unsig = self._obbox_embed(tgt).to(device)
+                # refpoint_embed = delta_unsig + refpoint_embed
+                # refpoint_embed = refpoint_embed.transpose(0, 1)
+                # tgt = tgt.transpose(0, 1)
+                #加入第二阶段动态查询
+                if self.dq:
+                    track_ids = targets[0]["track_id"]
+                    target_ids = targets[0]["gt_id"]
+                    #提取相邻两帧中相同对应id
+                    combined = torch.cat((track_ids,target_ids), dim=0)
+                    combined_val, counts = combined.unique(return_counts=True)
+                    common_elements = combined_val[counts>1]
+                    num_new_object= len(target_ids) - len(common_elements)
+                    tgt_dq = torch.cat([tgt, track_query],dim=1)
+                    refpoint_embed_dq = torch.cat([refpoint_embed, track_pos],dim=1)
+                    reference_points_input = box_ops.scale_obbox((refpoint_embed_dq.sigmoid())[:, :, None], valid_ratios[None, :], norm_angle= True).to(torch.float32)  # nq, bs, nlevel, 5                                       
+                    query_sine_embed = gen_sineembed_for_position(reference_points_input[:, :, 0, :], temperature=self.temperature) # nq, bs, 128 * 5
+                    if self.new_pos:
+                        query_pos =  query_sine_embed[:,:,0:256] + self.decoder.ref_point_head(query_sine_embed[:,:,256:])
+                        query_pos = query_pos.transpose(0,1)
+                    else:
+                        query_pos = self.decoder.ref_point_head(query_sine_embed).transpose(0,1)  # bs, nq, 256
+                    topk_proposals, object_cls_scores , cls_scores = self.object_select(tgt_dq.transpose(0, 1) ,query_pos, num_object_query=self.num_queries ,training=self.training, num_new_object=num_new_object)
+                    tgt = torch.gather(tgt, 1,
+                                  topk_proposals.unsqueeze(-1).repeat(1, 1, self.hidden_dim))
+                    refpoint_embed = torch.gather(refpoint_embed, 1,
+                                  topk_proposals.unsqueeze(-1).repeat(1, 1, 5)).sigmoid()
+                    outputs_mask = torch.gather(outputs_mask, 1,
+                                  topk_proposals.unsqueeze(-1).unsqueeze(-1).repeat(1, 1, outputs_mask.shape[-2], outputs_mask.shape[-1]))
+                    # if topk_proposals.shape[1] != self.num_queries:
+                    #     print("yes")
+                    self.num_queries = topk_proposals.shape[1]
+                    dq_outputs=dict()
+                    dq_outputs['pred_logits'] = object_cls_scores
+                    dq_outputs['pred_boxes'] = refpoint_embed.sigmoid()
+                    dq_outputs['pred_masks'] = outputs_mask
+                    dq_outputs['pred_logits_all'] = cls_scores
+                    targets[0]["num_query"] = self.num_queries
+                tgt = torch.cat([tgt, track_query],dim=1)
+                refpoint_embed = torch.cat([refpoint_embed, track_pos],dim=1)
+                M = refpoint_embed.shape[1]
+                if self.dn!="no":
+                    padding_tgt_mask = torch.full((M, M), False, device=tgt_mask.device)
+                    padding_tgt_mask[:N, :N] = tgt_mask
+                    padding_tgt_mask[N:M, :dn_num] = True
+                    tgt_mask = padding_tgt_mask
+                    del padding_tgt_mask
+                    del input_query_obbox
+                    del input_query_label
+            else:
+                track_query = tracker.track_query.transpose(0, 1)
+                track_pos = tracker.track_pos
+                # track_motion_cls  = self.motion_cls_pred(track_query.transpose(0, 1)).sigmoid()
+                # print(track_motion_cls.squeeze())
+                # track_pos = inverse_sigmoid(track_pos)
+                # 运动预测
+                object_query_score = interm_outputs['pred_logits'].sigmoid()
+                #object_query_center_pos = object_query_pos[:, :, :2]
+                #过滤掉成绩过低的检测
+                object_query_score = object_query_score[:, :, 0]
+                object_query_pos = object_query_pos[object_query_score >= (tracker.track_obj_score_thresh)].unsqueeze(0)
+                object_query_score = object_query_score[object_query_score >= (tracker.track_obj_score_thresh)].unsqueeze(0)
+                #采用中心点距离过滤掉重复的检测
+                indices_last = nms_distance(object_query_pos[0, : , :2], object_query_score[0], 0.01)
+                indices_last = torch.tensor(indices_last).unsqueeze(0).unsqueeze(-1).expand(-1, -1, object_query_pos.size(-1)).to(object_query_pos.device)
+                object_query_pos = torch.gather(object_query_pos, 1, indices_last)
+                #主要针对Fluo-N2DH-GOWT1数据集,计算检测面积
+                object_area = object_query_pos[0, :, 2] * object_query_pos[0, :, 3]
+                object_area = object_area.unsqueeze(0).repeat(tracker.track_num, 1)
+                # if tracker.frame_index == 4:
+                #     print("ok")
+                #     print(track_pos)
+                #     print(object_query_pos)
+                #     print(tracker.track_ids)
+                # object_query_center_pos[object_query_center_pos > 0.2] = 0
+                # 扩展维度以便能够进行广播操作
+                expanded_tensor1 = track_pos.unsqueeze(2)  # shape: [1, N, 1, 2]
+                expanded_tensor2 = object_query_pos.unsqueeze(1)  # shape: [1, 1, M, 2]
+                # 计算欧氏距离  
+                diff = expanded_tensor2 - expanded_tensor1  # 计算差值
+                distance = torch.sqrt(torch.sum(diff[:, :, :, :2] ** 2, dim=-1))  # 计算欧氏距离
+                #每个检测只保留一个和追踪之间的最小距离
+                # 找到每一列的最小值
+                min_values, _ = torch.min(distance, dim=1)
+                # 将除最小值外的其他值设为1
+                distance = torch.where(distance == min_values.unsqueeze(1), distance, 1.0)
+                # 获取每个 tensor1 中值对应的最小距离索引（最小的两个）
+                min_diatance, min_indices = torch.topk(distance, k=2, dim=2, largest=False)  # 获取最小距离索引
+                # 根据最小距离索引获取对应的 tensor2 中的值
+                min_diff = torch.gather(diff, 2, min_indices.unsqueeze(-1).repeat(1, 1, 1, 5))
+                # 面积
+                min_area = torch.gather(object_area, 1, min_indices[0])
+                mask_area = torch.all(min_area< tracker.min_area, dim=1)
+                indices_area = torch.nonzero(mask_area)
+                min_diff_copy = min_diff.clone()
+                if tracker.frame_index == 46 and tracker.dataset=="DIC-C2DH-HeLa":
+                    min_diff[min_diatance > 0.15] = 0
+                else:
+                    min_diff[min_diatance > tracker.track_min_distance] = 0
+                if tracker.frame_index in tracker.special_frame:
+                    min_diff[min_diatance > 0] = 0
+                # 创建一个索引掩码，用于找到满足条件的元素
+                mask = torch.all(min_diff[:, :, 1, :] == torch.tensor([0, 0, 0, 0, 0], dtype=torch.float64, device=min_diff.device), dim=2)
+                # 获取满足条件的元素的索引
+                indices = torch.nonzero(mask)
+                # 使用索引替换满足条件的元素
+                if tracker.dataset=="Fluo-N2DH-SIM+":
+                    min_diff[indices[:, 0], indices[:, 1], 1] = min_diff[indices[:, 0], indices[:, 1], 0] = 0
+                else:
+                    min_diff[indices[:, 0], indices[:, 1], 1] = min_diff[indices[:, 0], indices[:, 1], 0]
+                # 使用面积去判断分裂对于Fluo-N2DH-GOWT1
+                if len(indices_area) > 0 and tracker.dataset=="Fluo-N2DH-GOWT1":
+                    min_diff[0, indices_area[:,0]] = min_diff_copy[0, indices_area[:, 0]]
+                #min_diff[indices[:, 0], indices[:, 1]] = min_diff[indices[:, 0], indices[:, 1]] * 0
+                min_diff = torch.cat([min_diff[:, :, 0, :], min_diff[:, :, 1, :]], dim=1)
+    
+                track_pos = torch.cat((track_pos, track_pos), dim=1)
+                track_pos[:, :, :] = track_pos[:, :, :] + min_diff
+                # 将不可能发生分裂的置为全0
+                # track_pos = torch.gather(object_query_pos, 2, min_indices.unsqueeze(-1).repeat(1, 1, 1, 5))
+                track_pos = track_pos.transpose(0, 1)
                 #将query和pos进行复制
                 track_query = torch.cat([track_query, track_query], dim=0)
-                # track_pos = torch.cat([track_pos, track_pos], dim=0)
-                # track_pos = (inverse_sigmoid(track_pos) + track_motion_pred).sigmoid()
-                # track_pos = torch.cat([track_pos, track_pos_second], dim=1)
-                # del motion_feature_map
-                # track_pos = track_pos.transpose(0, 1)
-                # track_query = self.pre_track_query_process(track_query) + track_query
+                #调整track_qeury
                 reference_points_input = box_ops.scale_obbox((track_pos)[:, :, None], valid_ratios[None, :], norm_angle= True).to(torch.float32)  # nq, bs, nlevel, 5                                       
                 query_sine_embed = gen_sineembed_for_position(reference_points_input[:, :, 0, :], self.temperature) # nq, bs, 128 * 5
                 if self.new_pos:
@@ -1021,20 +1139,51 @@ class CgtDINODecoder(nn.Module):
                 reference_before_sigmoid = inverse_sigmoid(track_pos)
                 delta_unsig = self._obbox_embed(track_query).to(device)
                 track_pos = delta_unsig + reference_before_sigmoid
-
-                # delta_unsig[tracker.track_num:, :, :2] = -delta_unsig[tracker.track_num:, :, :2] 
-                # track_pos_second = inverse_sigmoid(delta_unsig) + reference_before_sigmoid
-                # track_pos_second = track_pos_second.transpose(0, 1)
-                
                 track_pos = track_pos.transpose(0, 1)
                 track_query = track_query.transpose(0, 1)
+                #调整object_query
+                # tgt = tgt.transpose(0,1)
+                # refpoint_embed = refpoint_embed.transpose(0,1)
+                # reference_points_input = box_ops.scale_obbox((refpoint_embed.sigmoid())[:, :, None], valid_ratios[None, :], norm_angle= True).to(torch.float32)  # nq, bs, nlevel, 5                                       
+                # query_sine_embed = gen_sineembed_for_position(reference_points_input[:, :, 0, :], self.temperature) # nq, bs, 128 * 5
+                # if self.new_pos:
+                #     query_pos = query_sine_embed[:,:,0:256] + self.decoder.ref_point_head(query_sine_embed[:,:,256:])
+                # else:
+                #     query_pos = self.decoder.ref_point_head(query_sine_embed)  # nq, bs, 256
+                # tgt = self.detection_query_process( tgt=tgt,
+                #                                 tgt_query_pos=query_pos,
+                #                                 tgt_reference_points=reference_points_input,
+                #                                 memory=src_flatten.transpose(0, 1),
+                #                                 memory_key_padding_mask=mask_flatten,
+                #                                 memory_level_start_index=level_start_index,
+                #                                 memory_spatial_shapes=spatial_shapes,)    
+                # delta_unsig = self._obbox_embed(tgt).to(device)
+                # refpoint_embed = delta_unsig + refpoint_embed
+                # refpoint_embed = refpoint_embed.transpose(0, 1)
+                # tgt = tgt.transpose(0, 1)
+                #加入第二阶段动态查询
+                if self.dq:
+                    tgt_dq = torch.cat([tgt, track_query],dim=1)
+                    refpoint_embed_dq = torch.cat([refpoint_embed, track_pos],dim=1)
+                    reference_points_input = box_ops.scale_obbox((refpoint_embed_dq.sigmoid())[:, :, None], valid_ratios[None, :], norm_angle= True).to(torch.float32)  # nq, bs, nlevel, 5                                       
+                    query_sine_embed = gen_sineembed_for_position(reference_points_input[:, :, 0, :], temperature=self.temperature) # nq, bs, 128 * 5
+                    if self.new_pos:
+                        query_pos =  query_sine_embed[:,:,0:256] + self.decoder.ref_point_head(query_sine_embed[:,:,256:])
+                        query_pos = query_pos.transpose(0,1)
+                    else:
+                        query_pos = self.decoder.ref_point_head(query_sine_embed).transpose(0,1)  # bs, nq, 256
+                    topk_proposals = self.object_select(tgt_dq.transpose(0, 1) ,query_pos, num_object_query=self.num_queries ,training=self.training)
+                    tgt = torch.gather(tgt, 1,
+                                  topk_proposals.unsqueeze(-1).repeat(1, 1, self.hidden_dim))
+                    refpoint_embed = torch.gather(refpoint_embed, 1,
+                                  topk_proposals.unsqueeze(-1).repeat(1, 1, 5)).sigmoid()
+                    outputs_mask = torch.gather(outputs_mask, 1,
+                                  topk_proposals.unsqueeze(-1).unsqueeze(-1).repeat(1, 1, outputs_mask.shape[-2], outputs_mask.shape[-1]))
+                    self.num_queries = topk_proposals.shape[1]
+                    num_select = self.num_queries
 
                 tgt = torch.cat([tgt, track_query],dim=1)
-                #tgt = torch.cat([tgt, zero_qeury],dim=1)
-                #tgt = torch.cat([tgt, track_query],dim=1)
                 refpoint_embed = torch.cat([refpoint_embed, track_pos],dim=1)
-                #refpoint_embed = torch.cat([refpoint_embed, zero_pos],dim=1)
-                #refpoint_embed = torch.cat([refpoint_embed, track_pos],dim=1)
     
         # direct prediction from the matching and denoising part in the begining
         if self.initial_pred and self.training:
@@ -1045,14 +1194,23 @@ class CgtDINODecoder(nn.Module):
             predictions_class.append(outputs_class)
             predictions_mask.append(outputs_mask)
 
-
+        #将深度特征加入targets中
+        # if self.simi and self.training:
+        #     mask_features_simi = mask_features.clone().detach()
+        #     fea_images = self.levelset_bottom(mask_features_simi)
+        #     if  tracker.track_num > 0:
+        #         fea_images = fea_images.detach()
+        #     for target, fea_image in zip(targets, fea_images):
+        #         target["fea_image"] = fea_image.squeeze(0)
 
         hs, references = self.decoder(
             tgt=tgt.transpose(0, 1),
+            tgt_track = track_query,
             memory=src_flatten.transpose(0, 1),
             memory_key_padding_mask=mask_flatten,
             pos=None,
             refpoints_unsigmoid=refpoint_embed.transpose(0, 1),
+            refpoints_unsigmoid_track=track_pos,
             level_start_index=level_start_index,
             spatial_shapes=spatial_shapes,
             valid_ratios=valid_ratios,
@@ -1067,7 +1225,10 @@ class CgtDINODecoder(nn.Module):
 
         for i, output in enumerate(hs):
             if self.with_position:
-                outputs_class, outputs_mask = self.forward_prediction_heads_with_position(output.transpose(0, 1), mask_features, out_boxes[i +1].transpose(0,1), valid_ratios, self.training or (i == len(hs)-1))
+                if not self.crop:
+                    outputs_class, outputs_mask = self.forward_prediction_heads_with_position(output.transpose(0, 1), mask_features, out_boxes[i +1].transpose(0,1), valid_ratios, self.training or (i == len(hs)-1))
+                else:
+                    outputs_class, outputs_mask = self.forward_prediction_heads_with_position_crop(output.transpose(0, 1), mask_features, out_boxes[i +1].transpose(0,1), valid_ratios, self.training or (i == len(hs)-1))
             else:
                 outputs_class, outputs_mask = self.forward_prediction_heads(output.transpose(0, 1), mask_features, self.training or (i == len(hs)-1))
             predictions_class.append(outputs_class)
@@ -1091,7 +1252,7 @@ class CgtDINODecoder(nn.Module):
             'pred_masks': predictions_mask[-1],
             'pred_boxes':out_boxes[-1],
             'query': hs[-1][:, dn_num:, :],
-            'pred_motion_cls': track_motion_cls, 
+            # 'pred_motion_cls': track_motion_cls, 
             # 'pred_motion': track_pos_undetach,
             'aux_outputs': self._set_aux_loss(
                 predictions_class if self.mask_classification else None, predictions_mask,out_boxes
@@ -1099,20 +1260,32 @@ class CgtDINODecoder(nn.Module):
         }
         if self.two_stage:
             out['interm_outputs'] = interm_outputs
+        # if tracker.track_num and self.training > 0:
+        #     out['track_outputs'] = track_outputs
+        if self.dq:
+            out['num_select'] = num_select
+            if self.training:
+                out['counting_output'] = counting_output
+                if tracker.track_num > 0:
+                    out['dq_outputs'] = dq_outputs
         return out, mask_dict
 
-    def forward_prediction_heads(self, output, mask_features, pred_mask=True):
+
+    def forward_prediction_heads(self, output, mask_features, pred_mask=True, item=False):
         decoder_output = self.decoder_norm(output)
         decoder_output = decoder_output.transpose(0, 1)
         outputs_class = self.class_embed(decoder_output).float()
         outputs_mask = None
         if pred_mask:
-            mask_embed = self.mask_embed(decoder_output)
+            if item:
+                mask_embed = self.mask_embed_item(decoder_output)
+            else:
+                mask_embed = self.mask_embed(decoder_output)
             outputs_mask = torch.einsum("bqc,bchw->bqhw", mask_embed, mask_features)
 
         return outputs_class, outputs_mask
 
-    def forward_prediction_heads_with_position(self, output, mask_features, reference_points, valid_ratios, pred_mask=True):
+    def forward_prediction_heads_with_position(self, output, mask_features, reference_points, valid_ratios, pred_mask=True, item=False):
         decoder_output = self.decoder_norm(output)
         decoder_output = decoder_output.transpose(0, 1)
         outputs_class = self.class_embed(decoder_output).float()
@@ -1125,7 +1298,10 @@ class CgtDINODecoder(nn.Module):
                 query_pos = query_pos.transpose(0,1)
             else:
                 query_pos = self.decoder.ref_point_head(query_sine_embed).transpose(0,1)  # bs, nq, 256
-            mask_embed = self.mask_embed(decoder_output + query_pos)
+            if item:
+                mask_embed = self.mask_embed_item(decoder_output + query_pos)
+            else:
+                mask_embed = self.mask_embed(decoder_output + query_pos)
             outputs_mask = torch.einsum("bqc,bchw->bqhw", mask_embed, mask_features)
             # 测试位置注意力机制，简单采用MLP映射并不能将位置编码映射为想要的样子
             # pe_layer = PositionEmbeddingSine(128, temperature=self.temperature, normalize=True)
@@ -1149,15 +1325,23 @@ class CgtDINODecoder(nn.Module):
 
         return outputs_class, outputs_mask
 
-    def forward_prediction_heads_crop(self, output, mask_features, pred_mask=True):
+    def forward_prediction_heads_with_position_crop(self, output, mask_features, reference_points, valid_ratios, pred_mask=True):
         decoder_output = self.decoder_norm(output)
         decoder_output = decoder_output.transpose(0, 1)
         outputs_class = self.class_embed(decoder_output).float()
         outputs_mask = None
         if pred_mask:
-            mask_embed = self.mask_embed(decoder_output)
-            outputs_mask = torch.einsum("bqc,bchw->bqhw", mask_embed, mask_features)
-
+            region_max_width, region_max_height = get_rotated_rect_vertices(reference_points)  #(B)
+            region_features = extract_region_features(mask_features, reference_points[:,:,:2], region_max_width, region_max_height)
+            reference_points_input = box_ops.scale_obbox((reference_points)[:, :, None], valid_ratios[None, :], norm_angle= True).to(torch.float32)  # nq, bs, nlevel, 5                                       
+            query_sine_embed = gen_sineembed_for_position(reference_points_input[:, :, 0, :], temperature=self.temperature) # nq, bs, 128 * 5
+            if self.new_pos:
+                query_pos =  query_sine_embed[:,:,0:256] + self.decoder.ref_point_head(query_sine_embed[:,:,256:])
+                query_pos = query_pos.transpose(0,1)
+            else:
+                query_pos = self.decoder.ref_point_head(query_sine_embed).transpose(0,1)  # bs, nq, 256
+            mask_embed = self.mask_embed(decoder_output + query_pos)
+            outputs_mask = torch.einsum("bqc,bqchw->bqhw", mask_embed, region_features)
         return outputs_class, outputs_mask
 
     # def multi_forward_prediction_heads(self, output, mask_features, pred_mask=True):
@@ -1196,6 +1380,7 @@ class CgtDINODecoder(nn.Module):
                 {"pred_logits": a, "pred_masks": b, "pred_boxes":c}
                 for a, b, c in zip(outputs_class[:-1], outputs_seg_masks[:-1], out_boxes[:-1])
             ]
+
 
 
 class TransformerDecoder(nn.Module):
@@ -1280,6 +1465,8 @@ class TransformerDecoder(nn.Module):
                 m._reset_parameters()
 
     def forward(self, tgt, memory,
+                tgt_track = None,
+                refpoints_unsigmoid_track = None,
                 tgt_mask: Optional[Tensor] = None,
                 memory_mask: Optional[Tensor] = None,
                 tgt_key_padding_mask: Optional[Tensor] = None,
@@ -1308,6 +1495,10 @@ class TransformerDecoder(nn.Module):
         ref_points = [reference_points]
 
         for layer_id, layer in enumerate(self.layers):
+            # if layer_id==1 and tgt_track!=None:
+            #         output = torch.cat([output, tgt_track], dim=0)
+            #         ref_points[-1] = torch.cat([ref_points[-1], refpoints_unsigmoid_track.sigmoid()], dim=0)
+            #         reference_points = torch.cat([reference_points, refpoints_unsigmoid_track.sigmoid()], dim=0)
             # preprocess ref points
             if self.training and self.decoder_query_perturber is not None and layer_id != 0:
                 reference_points = self.decoder_query_perturber(reference_points)
@@ -1345,7 +1536,6 @@ class TransformerDecoder(nn.Module):
                 delta_unsig = self.obbox_embed[layer_id](output).to(device)
                 outputs_unsig = delta_unsig + reference_before_sigmoid
                 new_reference_points = outputs_unsig.sigmoid()
-
                 reference_points = new_reference_points.detach()
                 # if layer_id != self.num_layers - 1:
                 ref_points.append(new_reference_points)
@@ -1365,7 +1555,7 @@ class DeformableTransformerDecoderLayer(nn.Module):
                  n_levels=4, n_heads=8, n_points=4,
                  use_deformable_box_attn=False,
                  key_aware_type=None,
-                 motion_pred=False,
+                 track_trans=False,
                  ):
         super().__init__()
 
@@ -1373,7 +1563,7 @@ class DeformableTransformerDecoderLayer(nn.Module):
         if use_deformable_box_attn:
             raise NotImplementedError
         else:
-            self.cross_attn = MSDeformAttn(d_model, n_levels, n_heads, n_points, motion_pred=motion_pred)
+            self.cross_attn = MSDeformAttn(d_model, n_levels, n_heads, n_points, motion_pred=False)
         self.dropout1 = nn.Dropout(dropout)
         self.norm1 = nn.LayerNorm(d_model)
 
@@ -1381,9 +1571,9 @@ class DeformableTransformerDecoderLayer(nn.Module):
         self.self_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout)
         self.dropout2 = nn.Dropout(dropout)
         self.norm2 = nn.LayerNorm(d_model)
-        if motion_pred:
+        if track_trans:
             self.self_attn = None
-        self.motion_pred = motion_pred
+        self.motion_pred = False
         # ffn
         self.linear1 = nn.Linear(d_model, d_ffn)
         self.activation = _get_activation_fn(activation)
@@ -1463,5 +1653,68 @@ class DeformableTransformerDecoderLayer(nn.Module):
         tgt = self.forward_ffn(tgt)
 
         return tgt
+
+
+class Objectselectattention(nn.Module):
+    def __init__(self, d_model=256, 
+                 dropout=0.1,
+                 n_heads=8,
+                 score_thresd=0.2,
+                ):
+        super().__init__()
+        # self attention
+        self.self_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.norm2 = nn.LayerNorm(d_model)
+        # ffn
+        self.class_emb = nn.Linear(d_model, 2)
+        self.score_thresd = score_thresd
+    @staticmethod
+    def with_pos_embed(tensor, pos):
+        return tensor if pos is None else tensor + pos
+
+    @autocast(enabled=False)
+    def forward(self,
+                # for tgt
+                tgt: Optional[Tensor],  # nq, bs, d_model
+                tgt_query_pos: Optional[Tensor] = None,  # pos for query. MLP(Sine(pos))
+                # sa
+                self_attn_mask: Optional[Tensor] = None,  # mask used for self-attention
+                num_object_query: int = 0,
+                training: bool = False,
+                num_new_object: int = 0,
+                ):
+        """
+        Input:
+            - tgt/tgt_query_pos: nq, bs, d_model
+            -
+        """
+        # self attention
+        if self.self_attn is not None:
+            q = k = self.with_pos_embed(tgt, tgt_query_pos)
+            tgt2 = self.self_attn(q, k, tgt, attn_mask=self_attn_mask)[0]
+            tgt = tgt + self.dropout2(tgt2)
+            tgt = self.norm2(tgt)
+        # filter
+        tgt = tgt[:num_object_query]
+        cls_scores_return = self.class_emb(tgt).transpose(0,1) 
+        cls_scores = cls_scores_return.sigmoid()
+        num_filter_query = (cls_scores[:, :, 0] > self.score_thresd).sum(dim=1)
+        num_object_query_list = [int(num_object_query*0.2), int(num_object_query*0.4), int(num_object_query*0.6), int(num_object_query*0.8), num_object_query]
+        if self.training:
+            num_filter_query = num_new_object 
+        for i in num_object_query_list:
+            if i >= num_filter_query:
+                top_k = i
+                break
+        topk_proposals = torch.topk(cls_scores[:, :, 0], top_k, dim=1)[1] #只需要cell概率最大的topk个值
+        cls_scores_return = torch.gather(cls_scores_return, 1,
+                                   topk_proposals.unsqueeze(-1).repeat(1, 1, 2)) 
+        # tgt_output = torch.gather(tgt, 1,
+        #                           topk_proposals.unsqueeze(-1).repeat(1, 1, self.hidden_dim))  # unsigmoid
+        if training:
+            return topk_proposals, cls_scores_return, cls_scores
+        else:
+            return topk_proposals
 
 

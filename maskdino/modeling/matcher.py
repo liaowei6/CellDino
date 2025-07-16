@@ -36,6 +36,34 @@ def batch_dice_loss(inputs: torch.Tensor, targets: torch.Tensor):
     loss = 1 - (numerator + 1) / (denominator + 1)
     return loss
 
+def extract_non_zero_points(mask):
+    """提取掩码中大于0的点"""
+    return torch.nonzero(mask > 0, as_tuple=False)
+
+def compute_mean(points):
+    """计算点的均值"""
+    if points.numel() == 0:
+        return torch.tensor([0.0, 0.0], device=points.device ,dtype=torch.float32)
+    return torch.mean(points.to(torch.float32), dim=0)
+
+def compute_l2_distance(mean1, mean2):
+    """计算两个均值之间的 L2 距离"""
+    return torch.norm(mean1[:, None] - mean2[None, :], dim=2)
+
+def average_distance_loss(input: torch.Tensor, targets: torch.Tensor):
+   # 提取大于0的点
+    h1, w1  = input.shape[-2:]
+    h2, w2 = targets.shape[-2:]
+    points_input = [extract_non_zero_points(mask) for mask in input]
+    points_target = [extract_non_zero_points(mask) for mask in targets]
+    # 计算均值
+    mean1 = torch.cat([compute_mean(points).unsqueeze(0) for points in points_input], dim=0)
+    mean2 = torch.cat([compute_mean(points).unsqueeze(0) for points in points_target], dim=0)
+    mean1 = mean1 / torch.tensor([h1, w1], device=mean1.device, dtype=torch.float32)
+    mean2 = mean2 / torch.tensor([h2, w2], device=mean2.device ,dtype=torch.float32)
+    # 计算 L2 距离
+    l2_distance = compute_l2_distance(mean1, mean2)
+    return l2_distance
 
 batch_dice_loss_jit = torch.jit.script(
     batch_dice_loss
@@ -182,7 +210,31 @@ class HungarianMatcher(nn.Module):
                     else:
                         cost_mask = batch_sigmoid_ce_loss_jit(out_mask, tgt_mask)
                         cost_dice = batch_dice_loss_jit(out_mask, tgt_mask)
-
+            elif "mask_simi" in cost:
+                out_mask = outputs["pred_masks"][b]  # [num_queries, H_pred, W_pred]
+                # gt masks are already padded when preparing target
+                tgt_mask = targets[b]["masks"].to(out_mask)
+                if tgt_mask.shape[0] == 0:
+                    cost_mask = torch.zeros([out_mask.shape[0], 0], device=out_mask.device)
+                    cost_dice = torch.zeros([out_mask.shape[0], 0], device=out_mask.device)
+                else:
+                    cost_mask = average_distance_loss(out_mask, tgt_mask)
+                    point_coords = torch.nonzero(tgt_mask > 0, as_tuple=False)
+                    point_coords_tgt = point_coords[:, 1:].long()
+                    point_coords = point_coords[:, 1:] / torch.tensor([tgt_mask.shape[-2], tgt_mask.shape[-1]], device=point_coords.device)
+                    point_coords = point_coords.unsqueeze(0)
+                    point_coords = torch.flip(point_coords, dims=[-1]) #将(y,x)转换为(x,y)
+                    #获取采样后的tgt_mask
+                    tgt_mask = tgt_mask[:, point_coords_tgt[:, 0], point_coords_tgt[:, 1]]
+                    out_mask = point_sample(
+                        out_mask.unsqueeze(1),
+                        point_coords.repeat(out_mask.shape[0], 1, 1),
+                        align_corners=False,
+                    ).squeeze(1)
+                    with autocast(enabled=False):
+                        out_mask = out_mask.float()
+                        tgt_mask = tgt_mask.float()
+                        cost_dice = batch_dice_loss(out_mask, tgt_mask)
             else:
                 cost_mask = torch.tensor(0).to(out_bbox)
                 cost_dice = torch.tensor(0).to(out_bbox)
@@ -199,8 +251,8 @@ class HungarianMatcher(nn.Module):
                 self.cost_mask * cost_mask
                 + self.cost_class * cost_class
                 + self.cost_dice * cost_dice
-                + self.cost_box*cost_bbox
-                + self.cost_giou*cost_giou
+                + self.cost_box * cost_bbox
+                + self.cost_giou * cost_giou
             )
             cost_matrix.append(-C)
             C = C.reshape(num_queries, -1).cpu()
