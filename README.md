@@ -27,7 +27,11 @@ We trained and evaluated our approach on 2D datasets from the **[Cell Tracking C
 
 "Fluo-N2DH-GOWT1",
 
-"Phc-C2DH-U373".
+"Phc-C2DH-U373",
+
+"Fluo-N2DH-SIM+",
+
+"Fluo-C2DL-MSC".
 
 To train on the CTC datasets please download and unzip the aforementioned datasets from the CTC from [here](http://celltrackingchallenge.net/2d-datasets/). Save the training data (without any renaming) of each cell type, called **Training Dataset** on the CTC website, to the folder: 
 ```
@@ -84,15 +88,15 @@ python datasets/2COCO.py
 To train CellDion, you can use the following command:
 
 ```cmd
-python train_net.py --num_gpus 1 --config-file config_path MODEL.WEIGHTS /path/to/checkpoint_file
+python train_net.py --num_gpus 1 --train_file train_json_file_path --val_file val_json_file_path --config-file config_path MODEL.WEIGHTS /path/to/checkpoint_file
 ```
 
 - **Inference**
 
-You can download the [pretrained model](https://github.com/liaowei6/CellDino/releases) and reproduce the results of our CTC submission using the following command.
+You can using the following command to inference.
 
 ```cmd
-python train_net.py --nums_gpus 1 --test --submit --config-file config_file --input_dir /path/to/input_dir --submit_dir /path/to/submit_dir MODEL.WEIGHTS /path/to/checkpoint_file
+python train_net.py --nums_gpus 1 --test --submit  --config-file config_file --input_dir /path/to/input_dir --submit_dir /path/to/submit_dir MODEL.WEIGHTS /path/to/checkpoint_file
 ```
 
 ### Acknowledgements
